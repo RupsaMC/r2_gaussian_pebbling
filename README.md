@@ -15,7 +15,7 @@ A pebble is formed by selecting a graph node (a pebble center) and expanding to 
 
 The experiments use a symmetrized KNN graph over 3D Gaussian splats.
 
-For an edge (i,j),
+For an edge $(i,j)$, the weight is
 
 $$
 w_{ij}
@@ -25,7 +25,7 @@ w_{ij}
 \right)
 $$
 
-with (k=6).
+with $k=6$.
 
 The weighted graph regularization term is
 
@@ -33,7 +33,8 @@ $$
 L_{\mathrm{lap}}
 =
 \sum_{(i,j)\in E}
-w_{ij}(\rho_i-\rho_j)^2.
+w_{ij}
+\left(\rho_i-\rho_j\right)^2
 $$
 
 The main experiments use a quadratic optimization surrogate:
@@ -41,11 +42,13 @@ The main experiments use a quadratic optimization surrogate:
 $$
 F(\rho)
 =
-\frac12\|\rho-\rho_0\|^2
+\frac{1}{2}
+\lVert\rho-\rho_0\rVert^2
 +
 \lambda
 \sum_{(i,j)\in E}
-w_{ij}(\rho_i-\rho_j)^2.
+w_{ij}
+\left(\rho_i-\rho_j\right)^2
 $$
 
 ## Experimental progression
