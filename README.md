@@ -14,41 +14,14 @@ A pebble is formed by selecting a graph node (a pebble center) and expanding to 
 
 The experiments use a symmetrized KNN graph over 3D Gaussian splats.
 
-For an edge $(i,j)$, the weight is
+Each graph edge is assigned a distance-based weight using the 3D distance
+between the corresponding Gaussian splats. The weighting parameter is k=6.
 
-$$
-w_{ij}
-=
-\exp\left(
--\frac{\lVert p_i-p_j\rVert^2}{k}
-\right)
-$$
+The graph regularization penalizes differences in Gaussian density between
+connected nodes, weighted by their spatial proximity.
 
-with $k=6$.
-
-The weighted graph regularization term is
-
-$$
-L_{\mathrm{lap}}
-=
-\sum_{(i,j)\in E}
-w_{ij}
-\left(\rho_i-\rho_j\right)^2
-$$
-
-The main experiments use a quadratic optimization surrogate:
-
-$$
-F(\rho)
-=
-\frac{1}{2}
-\lVert\rho-\rho_0\rVert^2
-+
-\lambda
-\sum_{(i,j)\in E}
-w_{ij}
-\left(\rho_i-\rho_j\right)^2
-$$
+The main experiments use a quadratic optimization surrogate to study how
+different pebble-selection strategies affect localized graph regularization.
 
 ## Experimental progression
 
@@ -62,27 +35,24 @@ The experiments proceed from simple to more adaptive pebbling strategies:
    - Includes edges crossing the boundary of a selected pebble region.
 
 3. **Adaptive disagreement-based pebbling**
-   - Pebble centers selected using local graph disagreement:
-
-$$
-D_i
-=
-\sum_{j\in N(i)}
-w_{ij}
-\left(\rho_i-\rho_j\right)^2
-$$
-4. **Selection-policy ablations**
-
-   * Most-dissimilar nodes
-   * Least-dissimilar nodes
-   * Mixed high/low disagreement
-   * Median/middle disagreement
-   * Random pebbling
+   - Pebble centers are selected according to local graph disagreement.
+   - High-disagreement nodes correspond to regions where neighbouring Gaussian
+     densities differ strongly.
+4. **Selection-policy comparison**
+   - Most-dissimilar regions
+   - Least-dissimilar regions
+   - Mixed high/low-disagreement regions
+   - Middle-disagreement regions
+   - Random pebbling
 
 5. **Spatially distributed disagreement-aware pebbling**
+   - High-disagreement candidates are selected while encouraging spatial
+     separation between pebble centers.
 
-   * High-disagreement candidates are selected subject to spatial separation.
-   * Farthest-point sampling is used to distribute high-disagreement pebble centers through the 3D Gaussian field.
+6. **High-disagreement + farthest-point pebbling**
+   - Candidate centers are restricted to high-disagreement nodes.
+   - Farthest-point sampling is then used to distribute the selected pebbles
+     across the 3D Gaussian field.
 
 ## Main observations so far
 
