@@ -10,7 +10,6 @@ The work was developed in the context of the R²-Gaussian / synthetic X-3D recon
 Can global graph-Laplacian regularization be approximated more efficiently by applying updates only to selected local graph regions ("pebbles")?
 
 A pebble is formed by selecting a graph node (a pebble center) and expanding to its local KNN neighbourhood. The experiments study how different rules for selecting pebble centers affect optimization quality at a fixed computational/edge budget.
-
 ## Graph formulation
 
 The experiments use a symmetrized KNN graph over 3D Gaussian splats.
@@ -56,24 +55,22 @@ $$
 The experiments proceed from simple to more adaptive pebbling strategies:
 
 1. **Toy pebbling**
-
-   * Initial proof-of-concept for localized graph updates.
+   - Initial proof-of-concept for localized graph updates.
 
 2. **Boundary-aware weighted pebbling**
-
-   * Uses the actual weighted KNN graph.
-   * Includes edges crossing the boundary of a selected pebble region.
+   - Uses the actual weighted KNN graph.
+   - Includes edges crossing the boundary of a selected pebble region.
 
 3. **Adaptive disagreement-based pebbling**
+   - Pebble centers selected using local graph disagreement:
 
-   * Pebble centers selected using local graph disagreement:
-
-   $$
-   D_i =
-   \sum_j
-   w_{ij}(\rho_i-\rho_j)^2.
-   $$
-
+$$
+D_i
+=
+\sum_{j\in N(i)}
+w_{ij}
+\left(\rho_i-\rho_j\right)^2
+$$
 4. **Selection-policy ablations**
 
    * Most-dissimilar nodes
