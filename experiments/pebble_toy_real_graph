@@ -1,0 +1,279 @@
+import time
+from pathlib import Path
+
+import numpy as np
+from scipy.spatial import cKDTree
+from scipy.sparse import csr_matrix
+
+
+K = 6
+SEED = 0
+
+DATASET = Path(
+    "~/r2_gaussian/data/synthetic_dataset/"
+    "cone_ntrain_50_angle_360/0_chest_cone/"
+    "init_0_chest_cone.npy"
+).expanduser()
+
+
+def build_symmetric_knn(points, k):
+    """
+    Build a symmetric/undirected KNN graph.
+
+    First compute directed KNN edges.
+    Then add both directions for every discovered pair.
+    """
+    tree = cKDTree(points)
+    _, nbrs = tree.query(points, k=k + 1)
+
+    nbrs = nbrs[:, 1:]
+
+    edges = set()
+
+    for i in range(points.shape[0]):
+        for j in nbrs[i]:
+            i = int(i)
+            j = int(j)
+
+            if i == j:
+                continue
+
+            a, b = sorted((i, j))
+            edges.add((a, b))
+
+    edges = np.asarray(sorted(edges), dtype=np.int64)
+
+    return edges
+
+
+def build_laplacian(n, edges):
+    """
+    Build an unweighted sparse graph Laplacian.
+    """
+    rows = []
+    cols = []
+    data = []
+
+    degree = np.zeros(n, dtype=np.float64)
+
+    for i, j in edges:
+        i = int(i)
+        j = int(j)
+
+        rows.extend([i, j])
+        cols.extend([j, i])
+        data.extend([-1.0, -1.0])
+
+        degree[i] += 1.0
+        degree[j] += 1.0
+
+    for i in range(n):
+        rows.append(i)
+        cols.append(i)
+        data.append(degree[i])
+
+    return csr_matrix(
+        (data, (rows, cols)),
+        shape=(n, n),
+    )
+
+
+def main():
+    print(f"Loading: {DATASET}")
+
+    x = np.load(DATASET, allow_pickle=False)
+
+    if x.ndim != 2 or x.shape[1] < 4:
+        raise ValueError(f"Expected (N, >=4), got {x.shape}")
+
+    points = x[:, :3].astype(np.float64, copy=False)
+    rho = x[:, 3].astype(np.float64, copy=False)
+
+    n = points.shape[0]
+
+    print(f"Nodes: {n}")
+    print(f"KNN K: {K}")
+    print(
+        f"Density range: "
+        f"[{rho.min():.6g}, {rho.max():.6g}]"
+    )
+
+    # ---------------------------------------------------------
+    # GRAPH
+    # ---------------------------------------------------------
+
+    t0 = time.perf_counter()
+
+    edges = build_symmetric_knn(points, K)
+    L_global = build_laplacian(n, edges)
+
+    graph_time = time.perf_counter() - t0
+
+    print("\nGRAPH")
+    print(f"Unique undirected edges: {len(edges):,}")
+    print(f"Laplacian nonzeros: {L_global.nnz:,}")
+    print(f"Graph construction time: {graph_time:.4f} s")
+
+    # ---------------------------------------------------------
+    # GLOBAL LAPLACIAN ACTION
+    # ---------------------------------------------------------
+
+    t0 = time.perf_counter()
+
+    global_delta = L_global @ rho
+
+    global_time = time.perf_counter() - t0
+
+    global_energy = float(rho @ global_delta)
+
+    print("\nGLOBAL")
+    print(f"L rho energy: {global_energy:.8e}")
+    print(f"Laplacian action time: {global_time:.6f} s")
+
+    # ---------------------------------------------------------
+    # TOY PEBBLE SCORE
+    # ---------------------------------------------------------
+
+    # S_i = sum_j |rho_i - rho_j|
+    scores = np.zeros(n, dtype=np.float64)
+
+    for i, j in edges:
+        diff = abs(rho[i] - rho[j])
+        scores[i] += diff
+        scores[j] += diff
+
+    pebble = int(np.argmax(scores))
+
+    # Pebble + its graph neighbors.
+    neighbors = set()
+
+    for i, j in edges:
+        if i == pebble:
+            neighbors.add(j)
+        elif j == pebble:
+            neighbors.add(i)
+
+    region = sorted({pebble, *neighbors})
+    region_set = set(region)
+
+    # ---------------------------------------------------------
+    # INDUCED LOCAL GRAPH
+    # ---------------------------------------------------------
+
+    local_edges = []
+
+    for i, j in edges:
+        if i in region_set and j in region_set:
+            local_edges.append((i, j))
+
+    local_edges = np.asarray(
+        local_edges,
+        dtype=np.int64,
+    ).reshape(-1, 2)
+
+    # Map global node IDs -> local IDs.
+    local_index = {
+        node: idx
+        for idx, node in enumerate(region)
+    }
+
+    local_edges_remapped = np.asarray(
+        [
+            [local_index[int(i)], local_index[int(j)]]
+            for i, j in local_edges
+        ],
+        dtype=np.int64,
+    )
+
+    L_local = build_laplacian(
+        len(region),
+        local_edges_remapped,
+    )
+
+    rho_local = rho[region]
+
+    # ---------------------------------------------------------
+    # LOCAL LAPLACIAN ACTION
+    # ---------------------------------------------------------
+
+    t0 = time.perf_counter()
+
+    local_delta = L_local @ rho_local
+
+    local_time = time.perf_counter() - t0
+
+    # ---------------------------------------------------------
+    # COMPARE LOCAL ACTION TO GLOBAL ACTION
+    # ---------------------------------------------------------
+
+    global_region_delta = global_delta[region]
+
+    abs_error = np.abs(
+        local_delta - global_region_delta
+    )
+
+    l2_error = np.linalg.norm(
+        local_delta - global_region_delta
+    )
+
+    global_region_norm = np.linalg.norm(
+        global_region_delta
+    )
+
+    relative_action_error = (
+        l2_error / max(global_region_norm, 1e-12)
+    )
+
+    # Local energy.
+    local_energy = float(
+        rho_local @ local_delta
+    )
+
+    # ---------------------------------------------------------
+    # WORK
+    # ---------------------------------------------------------
+
+    global_work = L_global.nnz
+    local_work = L_local.nnz
+
+    work_ratio = local_work / global_work
+    work_saved = 100.0 * (1.0 - work_ratio)
+
+    # ---------------------------------------------------------
+    # REPORT
+    # ---------------------------------------------------------
+
+    print("\nPEBBLE")
+    print(f"Pebble node: {pebble}")
+    print(f"Pebble score: {scores[pebble]:.8e}")
+    print(f"Region size: {len(region)} nodes")
+    print(f"Region: {region}")
+
+    print("\nLOCAL GRAPH")
+    print(f"Local undirected edges: {len(local_edges):,}")
+    print(f"Local Laplacian nonzeros: {L_local.nnz:,}")
+    print(f"Local energy: {local_energy:.8e}")
+    print(f"Local action time: {local_time:.6f} s")
+
+    print("\nGLOBAL vs LOCAL ACTION")
+    print(f"Global region action L2 norm: {global_region_norm:.8e}")
+    print(f"Action absolute L2 error: {l2_error:.8e}")
+    print(f"Action relative error: {relative_action_error:.8e}")
+
+    print("\nWORK")
+    print(f"Global Laplacian nonzeros: {global_work:,}")
+    print(f"Local Laplacian nonzeros:  {local_work:,}")
+    print(f"Pebble / Global work:       {work_ratio:.8f}")
+    print(f"Approx. work saved:         {work_saved:.4f}%")
+
+    print("\nNOTE")
+    print(
+        "The local induced graph omits boundary edges from the "
+        "pebble region to nodes outside the region. Therefore "
+        "local_delta is not expected to equal the corresponding "
+        "entries of global_delta exactly."
+    )
+
+
+if __name__ == "__main__":
+    main()

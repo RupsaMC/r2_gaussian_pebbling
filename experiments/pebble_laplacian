@@ -1,0 +1,129 @@
+import csv
+import time
+from pathlib import Path
+
+import numpy as np
+from scipy.spatial import cKDTree
+
+
+K = 6
+PEBBLE_PCTS = [1, 5, 10, 20]
+WEIGHT_DENOM = 6.0
+SEED = 0
+
+DATASET = Path(
+    "~/r2_gaussian/data/synthetic_dataset/"
+    "cone_ntrain_50_angle_360/0_chest_cone/"
+    "init_0_chest_cone.npy"
+).expanduser()
+
+OUT = Path("~/r2_gaussian/experiments").expanduser()
+OUT.mkdir(parents=True, exist_ok=True)
+
+
+def build_knn(points: np.ndarray, k: int):
+    """Return directed KNN indices and Euclidean distances."""
+    tree = cKDTree(points)
+    dists, nbrs = tree.query(points, k=k + 1)
+
+    # Remove self-neighbor in column 0.
+    return nbrs[:, 1:], dists[:, 1:]
+
+
+def main():
+    rng = np.random.default_rng(SEED)
+
+    print(f"Loading: {DATASET}")
+    x = np.load(DATASET, allow_pickle=False)
+
+    if x.ndim != 2 or x.shape[1] < 4:
+        raise ValueError(f"Expected (N, >=4), got {x.shape}")
+
+    points = x[:, :3].astype(np.float32, copy=False)
+    rho = x[:, 3].astype(np.float32, copy=False)
+
+    n = points.shape[0]
+
+    print(f"Points: {n}")
+    print(f"KNN K: {K}")
+    print(f"Density range: [{rho.min():.6g}, {rho.max():.6g}]")
+
+    t0 = time.perf_counter()
+    nbrs, dists = build_knn(points, K)
+    graph_time = time.perf_counter() - t0
+
+    weights = np.exp(-(dists ** 2) / WEIGHT_DENOM).astype(np.float32)
+
+    rho_i = rho[:, None]
+    rho_j = rho[nbrs]
+
+    edge_energy = weights * (rho_i - rho_j) ** 2
+    node_score = edge_energy.sum(axis=1)
+
+    full_energy = float(edge_energy.sum())
+    total_directed_edges = n * K
+
+    print(f"KNN construction: {graph_time:.4f} s")
+    print(f"Total directed edges: {total_directed_edges:,}")
+    print(f"Full Laplacian energy: {full_energy:.8e}")
+
+    rows = []
+
+    for pct in PEBBLE_PCTS:
+        num_nodes = max(1, int(round(n * pct / 100.0)))
+
+        t0 = time.perf_counter()
+
+        # Adaptive pebble selection: choose highest local Laplacian energy.
+        selected = np.argpartition(
+            node_score,
+            -num_nodes
+        )[-num_nodes:]
+
+        pebble_energy = float(edge_energy[selected].sum())
+
+        elapsed = time.perf_counter() - t0
+
+        selected_edges = num_nodes * K
+        rel_error = abs(pebble_energy - full_energy) / max(abs(full_energy), 1e-12)
+        retained_fraction = pebble_energy / max(full_energy, 1e-12)
+
+        rows.append(
+            {
+                "pebble_pct": pct,
+                "selected_nodes": num_nodes,
+                "selected_edges": selected_edges,
+                "edge_fraction": selected_edges / total_directed_edges,
+                "pebble_energy": pebble_energy,
+                "full_energy": full_energy,
+                "relative_error": rel_error,
+                "retained_energy_fraction": retained_fraction,
+                "selection_time_sec": elapsed,
+            }
+        )
+
+        print(
+            f"{pct:>3}% | "
+            f"nodes={num_nodes:>6,} | "
+            f"edges={selected_edges:>7,} | "
+            f"energy={pebble_energy:.8e} | "
+            f"retained={retained_fraction:.4f} | "
+            f"rel_error={rel_error:.4f}"
+        )
+
+    csv_path = OUT / "pebble_laplacian_results.csv"
+
+    with csv_path.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=rows[0].keys())
+        writer.writeheader()
+        writer.writerows(rows)
+
+    np.save(OUT / "node_scores.npy", node_score)
+    np.save(OUT / "knn_indices.npy", nbrs)
+    np.save(OUT / "knn_distances.npy", dists)
+
+    print(f"\nSaved results to: {csv_path}")
+
+
+if __name__ == "__main__":
+    main()

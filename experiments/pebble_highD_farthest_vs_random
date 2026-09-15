@@ -1,0 +1,1705 @@
+#!/usr/bin/env python3
+
+import math
+from dataclasses import dataclass
+from pathlib import Path
+
+import numpy as np
+from scipy.spatial import cKDTree
+from scipy.sparse import coo_matrix
+from scipy.sparse.linalg import cg
+
+
+# ============================================================
+# Configuration
+# ============================================================
+
+N = 50_000
+
+KNN = 6
+WEIGHT_K = 6.0
+
+LAMBDA = 1.0
+LR = 0.02
+STEPS = 200
+
+TARGET_EDGE_BUDGETS = [
+    16_000,
+    50_000,
+    75_000,
+]
+
+RANDOM_SEEDS = [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+]
+
+# ------------------------------------------------------------
+# New hypothesis parameters
+# ------------------------------------------------------------
+
+# Only the top 10% of nodes by disagreement are eligible
+# to become pebble centers.
+HIGH_D_FRACTION = 0.10
+
+# How often the pebble set is recomputed.
+#
+# Both strategies use the same refresh interval for fairness.
+SELECTION_INTERVAL = 10
+
+
+# ============================================================
+# Paths
+# ============================================================
+
+DATASET = Path(
+    "~/r2_gaussian/data/synthetic_dataset/"
+    "cone_ntrain_50_angle_360/0_chest_cone/"
+    "init_0_chest_cone.npy"
+).expanduser()
+
+OUT_DIR = Path(
+    "~/r2_gaussian/experiments"
+).expanduser()
+
+OUT_DIR.mkdir(
+    parents=True,
+    exist_ok=True,
+)
+
+OUT_PATH = (
+    OUT_DIR
+    / "pebble_highD_farthest_vs_random_results.npz"
+)
+
+
+# ============================================================
+# Graph structure
+# ============================================================
+
+@dataclass
+class Graph:
+    xyz: np.ndarray
+    edges_i: np.ndarray
+    edges_j: np.ndarray
+    weights: np.ndarray
+    neighbors: np.ndarray
+
+
+# ============================================================
+# Graph construction
+# ============================================================
+
+def build_graph(
+    xyz: np.ndarray,
+    k: int = KNN,
+    weight_k: float = WEIGHT_K,
+) -> Graph:
+    """
+    Build the symmetrized KNN graph.
+
+    Edge (i,j) exists when either node selects the other
+    among its K nearest neighbours.
+
+    Weight:
+
+        w_ij = exp(-||p_i-p_j||^2 / weight_k)
+    """
+
+    print("Building KNN graph...")
+
+    tree = cKDTree(xyz)
+
+    dists, knn = tree.query(
+        xyz,
+        k=k + 1,
+        workers=-1,
+    )
+
+    # Remove self-neighbour.
+    knn = knn[:, 1:]
+    dists = dists[:, 1:]
+
+    neighbors = knn.astype(
+        np.int32
+    )
+
+    # Symmetrized edge set.
+    edge_set = set()
+
+    for i in range(len(xyz)):
+
+        for q in range(k):
+
+            j = int(
+                knn[i, q]
+            )
+
+            a = min(i, j)
+            b = max(i, j)
+
+            edge_set.add(
+                (a, b)
+            )
+
+    edges_i = np.empty(
+        len(edge_set),
+        dtype=np.int32,
+    )
+
+    edges_j = np.empty(
+        len(edge_set),
+        dtype=np.int32,
+    )
+
+    weights = np.empty(
+        len(edge_set),
+        dtype=np.float64,
+    )
+
+    for e, (i, j) in enumerate(
+        edge_set
+    ):
+
+        edges_i[e] = i
+        edges_j[e] = j
+
+        dist2 = np.sum(
+            (
+                xyz[i]
+                - xyz[j]
+            ) ** 2
+        )
+
+        weights[e] = math.exp(
+            -dist2 / weight_k
+        )
+
+    print(
+        f"Nodes: {len(xyz):,}"
+    )
+
+    print(
+        "Unique undirected edges: "
+        f"{len(weights):,}"
+    )
+
+    return Graph(
+        xyz=xyz,
+        edges_i=edges_i,
+        edges_j=edges_j,
+        weights=weights,
+        neighbors=neighbors,
+    )
+
+
+# ============================================================
+# Node disagreement
+# ============================================================
+
+def node_dissimilarity(
+    rho: np.ndarray,
+    graph: Graph,
+) -> np.ndarray:
+    """
+    D_i = sum_j w_ij * (rho_i-rho_j)^2
+
+    Larger D_i = stronger local graph disagreement.
+    """
+
+    i = graph.edges_i
+    j = graph.edges_j
+    w = graph.weights
+
+    diff2 = (
+        rho[i]
+        - rho[j]
+    ) ** 2
+
+    contribution = (
+        w * diff2
+    )
+
+    score = np.zeros(
+        len(rho),
+        dtype=np.float64,
+    )
+
+    np.add.at(
+        score,
+        i,
+        contribution,
+    )
+
+    np.add.at(
+        score,
+        j,
+        contribution,
+    )
+
+    return score
+
+
+# ============================================================
+# High-disagreement candidate pool
+# ============================================================
+
+def get_high_disagreement_candidates(
+    score: np.ndarray,
+) -> np.ndarray:
+    """
+    Keep only the highest-disagreement fraction of nodes.
+
+    Example:
+        50,000 nodes
+        10% candidate fraction
+        -> 5,000 candidates
+    """
+
+    n = len(score)
+
+    candidate_count = max(
+        2,
+        int(
+            math.ceil(
+                n
+                * HIGH_D_FRACTION
+            )
+        ),
+    )
+
+    candidate_count = min(
+        candidate_count,
+        n,
+    )
+
+    candidates = np.argpartition(
+        score,
+        -candidate_count,
+    )[-candidate_count:]
+
+    candidates = candidates[
+        np.argsort(
+            score[candidates]
+        )[::-1]
+    ]
+
+    return candidates.astype(
+        np.int32
+    )
+
+
+# ============================================================
+# High-D + farthest-point pebble centers
+# ============================================================
+
+def choose_highD_farthest_centers(
+    score: np.ndarray,
+    xyz: np.ndarray,
+    n_centers: int,
+) -> np.ndarray:
+    """
+    NEW HYPOTHESIS.
+
+    Step 1:
+        Keep only the top HIGH_D_FRACTION nodes by disagreement.
+
+    Step 2:
+        Select the highest-disagreement candidate first.
+
+    Step 3:
+        Repeatedly select the candidate that is farthest from
+        every already-selected pebble center.
+
+    Thus every chosen center is:
+        - high disagreement
+        - spatially separated from previous centers
+
+    This is greedy farthest-point sampling restricted to
+    high-disagreement nodes.
+    """
+
+    candidates = (
+        get_high_disagreement_candidates(
+            score
+        )
+    )
+
+    n_candidates = len(
+        candidates
+    )
+
+    n_centers = min(
+        n_centers,
+        n_candidates,
+    )
+
+    # --------------------------------------------------------
+    # First point: highest disagreement.
+    # --------------------------------------------------------
+
+    first = candidates[0]
+
+    selected = np.empty(
+        n_centers,
+        dtype=np.int32,
+    )
+
+    selected[0] = first
+
+    if n_centers == 1:
+        return selected
+
+    # --------------------------------------------------------
+    # Minimum distance from each candidate to selected set.
+    # --------------------------------------------------------
+
+    candidate_xyz = xyz[
+        candidates
+    ]
+
+    first_xyz = xyz[
+        first
+    ]
+
+    diff = (
+        candidate_xyz
+        - first_xyz
+    )
+
+    min_dist_sq = np.sum(
+        diff * diff,
+        axis=1,
+    )
+
+    # Prevent reselecting first point.
+    min_dist_sq[
+        candidates == first
+    ] = -1.0
+
+    # --------------------------------------------------------
+    # Greedy farthest-point sampling.
+    # --------------------------------------------------------
+
+    for s in range(
+        1,
+        n_centers,
+    ):
+
+        best_local = int(
+            np.argmax(
+                min_dist_sq
+            )
+        )
+
+        selected_node = int(
+            candidates[
+                best_local
+            ]
+        )
+
+        selected[s] = (
+            selected_node
+        )
+
+        selected_xyz = xyz[
+            selected_node
+        ]
+
+        diff = (
+            candidate_xyz
+            - selected_xyz
+        )
+
+        dist_sq = np.sum(
+            diff * diff,
+            axis=1,
+        )
+
+        # Update each candidate's distance to its nearest
+        # selected center.
+        min_dist_sq = np.minimum(
+            min_dist_sq,
+            dist_sq,
+        )
+
+        # Prevent reselection.
+        min_dist_sq[
+            candidates
+            == selected_node
+        ] = -1.0
+
+    return selected
+
+
+# ============================================================
+# Random pebble centers
+# ============================================================
+
+def choose_random_centers(
+    n: int,
+    n_centers: int,
+    rng: np.random.Generator,
+) -> np.ndarray:
+
+    return rng.choice(
+        n,
+        size=n_centers,
+        replace=False,
+    ).astype(
+        np.int32
+    )
+
+
+# ============================================================
+# Pebble expansion
+# ============================================================
+
+def expand_centers(
+    centers: np.ndarray,
+    graph: Graph,
+) -> np.ndarray:
+    """
+    Each pebble is:
+
+        center + KNN(center)
+
+    The total region is their union.
+    """
+
+    region_mask = np.zeros(
+        len(graph.xyz),
+        dtype=bool,
+    )
+
+    region_mask[
+        centers
+    ] = True
+
+    for center in centers:
+
+        region_mask[
+            graph.neighbors[center]
+        ] = True
+
+    return np.flatnonzero(
+        region_mask
+    )
+
+
+# ============================================================
+# Touched-edge mask
+# ============================================================
+
+def touched_edge_mask(
+    region: np.ndarray,
+    graph: Graph,
+) -> np.ndarray:
+    """
+    An edge is touched if at least one endpoint is inside
+    the selected pebble region.
+    """
+
+    region_mask = np.zeros(
+        len(graph.xyz),
+        dtype=bool,
+    )
+
+    region_mask[
+        region
+    ] = True
+
+    return (
+        region_mask[
+            graph.edges_i
+        ]
+        |
+        region_mask[
+            graph.edges_j
+        ]
+    )
+
+
+# ============================================================
+# Calibrate number of centers to edge budget
+# ============================================================
+
+def select_centers(
+    score: np.ndarray,
+    xyz: np.ndarray,
+    strategy: str,
+    n_centers: int,
+    rng: np.random.Generator,
+) -> np.ndarray:
+
+    if strategy == "highD_farthest":
+
+        return (
+            choose_highD_farthest_centers(
+                score=score,
+                xyz=xyz,
+                n_centers=n_centers,
+            )
+        )
+
+    if strategy == "random":
+
+        return choose_random_centers(
+            n=len(score),
+            n_centers=n_centers,
+            rng=rng,
+        )
+
+    raise ValueError(
+        f"Unknown strategy: {strategy}"
+    )
+
+
+def calibrate_center_count(
+    score: np.ndarray,
+    xyz: np.ndarray,
+    graph: Graph,
+    strategy: str,
+    target_edges: int,
+    rng: np.random.Generator,
+):
+    """
+    Calibrate a fixed number of centers using the initial
+    disagreement state.
+
+    We do this once per strategy/budget.
+
+    This avoids an expensive binary-search selection on every
+    optimization iteration.
+    """
+
+    n = len(score)
+
+    # Reasonable initial estimate.
+    low = 1
+
+    high = min(
+        n,
+        max(
+            2,
+            target_edges // (
+                2 * KNN
+            ),
+        ),
+    )
+
+    best_count = 1
+    best_error = float(
+        "inf"
+    )
+
+    # --------------------------------------------------------
+    # Expand upper bound.
+    # --------------------------------------------------------
+
+    while high < n:
+
+        centers = select_centers(
+            score=score,
+            xyz=xyz,
+            strategy=strategy,
+            n_centers=high,
+            rng=rng,
+        )
+
+        region = expand_centers(
+            centers,
+            graph,
+        )
+
+        edge_mask = touched_edge_mask(
+            region,
+            graph,
+        )
+
+        edge_count = int(
+            edge_mask.sum()
+        )
+
+        error = abs(
+            edge_count
+            - target_edges
+        )
+
+        if error < best_error:
+
+            best_error = error
+            best_count = high
+
+        if edge_count >= target_edges:
+            break
+
+        high = min(
+            n,
+            high * 2,
+        )
+
+    # --------------------------------------------------------
+    # Binary search.
+    # --------------------------------------------------------
+
+    left = low
+    right = high
+
+    while left <= right:
+
+        mid = (
+            left + right
+        ) // 2
+
+        centers = select_centers(
+            score=score,
+            xyz=xyz,
+            strategy=strategy,
+            n_centers=mid,
+            rng=rng,
+        )
+
+        region = expand_centers(
+            centers,
+            graph,
+        )
+
+        edge_mask = touched_edge_mask(
+            region,
+            graph,
+        )
+
+        edge_count = int(
+            edge_mask.sum()
+        )
+
+        error = abs(
+            edge_count
+            - target_edges
+        )
+
+        if error < best_error:
+
+            best_error = error
+            best_count = mid
+
+        if edge_count < target_edges:
+
+            left = mid + 1
+
+        elif edge_count > target_edges:
+
+            right = mid - 1
+
+        else:
+
+            break
+
+    return best_count
+
+
+# ============================================================
+# Objective
+# ============================================================
+
+def graph_energy(
+    rho: np.ndarray,
+    graph: Graph,
+) -> float:
+
+    i = graph.edges_i
+    j = graph.edges_j
+    w = graph.weights
+
+    return float(
+        np.sum(
+            w
+            * (
+                rho[i]
+                - rho[j]
+            ) ** 2
+        )
+    )
+
+
+def objective(
+    rho: np.ndarray,
+    rho0: np.ndarray,
+    graph: Graph,
+    lam: float,
+) -> float:
+
+    data_term = (
+        0.5
+        * np.sum(
+            (rho - rho0) ** 2
+        )
+    )
+
+    smooth_term = (
+        lam
+        * graph_energy(
+            rho,
+            graph,
+        )
+    )
+
+    return float(
+        data_term
+        + smooth_term
+    )
+
+
+# ============================================================
+# Full Laplacian action
+# ============================================================
+
+def full_laplacian_action(
+    rho: np.ndarray,
+    graph: Graph,
+) -> np.ndarray:
+
+    i = graph.edges_i
+    j = graph.edges_j
+    w = graph.weights
+
+    out = np.zeros(
+        len(rho),
+        dtype=np.float64,
+    )
+
+    diff = (
+        rho[i]
+        - rho[j]
+    )
+
+    contribution = (
+        w * diff
+    )
+
+    np.add.at(
+        out,
+        i,
+        contribution,
+    )
+
+    np.add.at(
+        out,
+        j,
+        -contribution,
+    )
+
+    return out
+
+
+# ============================================================
+# Local boundary-aware gradient
+# ============================================================
+
+def local_gradient(
+    rho: np.ndarray,
+    rho0: np.ndarray,
+    graph: Graph,
+    edge_mask: np.ndarray,
+    lam: float,
+) -> np.ndarray:
+
+    i = graph.edges_i[
+        edge_mask
+    ]
+
+    j = graph.edges_j[
+        edge_mask
+    ]
+
+    w = graph.weights[
+        edge_mask
+    ]
+
+    grad = (
+        rho - rho0
+    ).copy()
+
+    diff = (
+        rho[i]
+        - rho[j]
+    )
+
+    contribution = (
+        2.0
+        * lam
+        * w
+        * diff
+    )
+
+    np.add.at(
+        grad,
+        i,
+        contribution,
+    )
+
+    np.add.at(
+        grad,
+        j,
+        -contribution,
+    )
+
+    return grad
+
+
+# ============================================================
+# Spatial spread metric
+# ============================================================
+
+def mean_nearest_center_distance(
+    centers: np.ndarray,
+    xyz: np.ndarray,
+) -> float:
+    """
+    Average distance from each selected center to its nearest
+    other selected center.
+
+    Larger = more spatially separated.
+    """
+
+    if len(centers) < 2:
+        return 0.0
+
+    points = xyz[
+        centers
+    ]
+
+    tree = cKDTree(
+        points
+    )
+
+    distances, _ = tree.query(
+        points,
+        k=2,
+    )
+
+    return float(
+        distances[:, 1].mean()
+    )
+
+
+# ============================================================
+# Full optimization
+# ============================================================
+
+def run_full_optimization(
+    rho0: np.ndarray,
+    graph: Graph,
+):
+
+    rho = rho0.copy()
+
+    objectives = []
+
+    for _ in range(STEPS):
+
+        grad = (
+            rho
+            - rho0
+            + 2.0
+            * LAMBDA
+            * full_laplacian_action(
+                rho,
+                graph,
+            )
+        )
+
+        rho -= (
+            LR
+            * grad
+        )
+
+        objectives.append(
+            objective(
+                rho,
+                rho0,
+                graph,
+                LAMBDA,
+            )
+        )
+
+    return (
+        rho,
+        np.asarray(
+            objectives
+        ),
+    )
+
+
+# ============================================================
+# Pebbled optimization
+# ============================================================
+
+def run_pebbled_optimization(
+    rho0: np.ndarray,
+    graph: Graph,
+    strategy: str,
+    target_edges: int,
+    seed: int,
+):
+    """
+    The pebble set is recomputed every SELECTION_INTERVAL steps.
+
+    Both strategies use the same refresh schedule.
+    """
+
+    rng = np.random.default_rng(
+        seed
+    )
+
+    rho = rho0.copy()
+
+    # --------------------------------------------------------
+    # Calibrate number of centers using the initial state.
+    # --------------------------------------------------------
+
+    initial_score = (
+        node_dissimilarity(
+            rho,
+            graph,
+        )
+    )
+
+    n_centers = (
+        calibrate_center_count(
+            score=initial_score,
+            xyz=graph.xyz,
+            graph=graph,
+            strategy=strategy,
+            target_edges=target_edges,
+            rng=rng,
+        )
+    )
+
+    print(
+        f"    calibrated centers: "
+        f"{n_centers}"
+    )
+
+    # --------------------------------------------------------
+    # Current selected region.
+    # --------------------------------------------------------
+
+    centers = None
+    region = None
+    edge_mask = None
+
+    objectives = []
+    edge_counts = []
+    center_counts = []
+    region_counts = []
+    spread_values = []
+
+    # --------------------------------------------------------
+    # Optimize.
+    # --------------------------------------------------------
+
+    for step in range(
+        STEPS
+    ):
+
+        # Re-select pebbles periodically.
+        if (
+            step % SELECTION_INTERVAL
+            == 0
+        ):
+
+            score = (
+                node_dissimilarity(
+                    rho,
+                    graph,
+                )
+            )
+
+            centers = select_centers(
+                score=score,
+                xyz=graph.xyz,
+                strategy=strategy,
+                n_centers=n_centers,
+                rng=rng,
+            )
+
+            region = expand_centers(
+                centers,
+                graph,
+            )
+
+            edge_mask = (
+                touched_edge_mask(
+                    region,
+                    graph,
+                )
+            )
+
+        # ----------------------------------------------------
+        # Exact local gradient.
+        # ----------------------------------------------------
+
+        grad = local_gradient(
+            rho=rho,
+            rho0=rho0,
+            graph=graph,
+            edge_mask=edge_mask,
+            lam=LAMBDA,
+        )
+
+        # Update only the selected pebble region.
+        update_mask = np.zeros(
+            len(rho),
+            dtype=bool,
+        )
+
+        update_mask[
+            region
+        ] = True
+
+        grad[
+            ~update_mask
+        ] = 0.0
+
+        rho -= (
+            LR
+            * grad
+        )
+
+        # ----------------------------------------------------
+        # Log.
+        # ----------------------------------------------------
+
+        objectives.append(
+            objective(
+                rho,
+                rho0,
+                graph,
+                LAMBDA,
+            )
+        )
+
+        edge_counts.append(
+            int(
+                edge_mask.sum()
+            )
+        )
+
+        center_counts.append(
+            len(centers)
+        )
+
+        region_counts.append(
+            len(region)
+        )
+
+        spread_values.append(
+            mean_nearest_center_distance(
+                centers,
+                graph.xyz,
+            )
+        )
+
+    return {
+        "rho": rho,
+        "objectives": np.asarray(
+            objectives
+        ),
+        "edge_counts": np.asarray(
+            edge_counts
+        ),
+        "center_counts": np.asarray(
+            center_counts
+        ),
+        "region_counts": np.asarray(
+            region_counts
+        ),
+        "spread_values": np.asarray(
+            spread_values
+        ),
+        "n_centers": n_centers,
+    }
+
+
+# ============================================================
+# Main experiment
+# ============================================================
+
+def main():
+
+    print("=" * 70)
+
+    print(
+        "HIGH-DISSIMILARITY + "
+        "FARTHEST-POINT PEBBLING VS RANDOM"
+    )
+
+    print("=" * 70)
+
+    # --------------------------------------------------------
+    # Load.
+    # --------------------------------------------------------
+
+    print(
+        "Loading:",
+        DATASET,
+    )
+
+    if not DATASET.exists():
+
+        raise FileNotFoundError(
+            "\nDataset not found:\n"
+            f"{DATASET}\n"
+        )
+
+    x = np.load(
+        DATASET,
+        allow_pickle=False,
+    )
+
+    if (
+        x.ndim != 2
+        or x.shape[1] < 4
+    ):
+
+        raise ValueError(
+            "Expected init array "
+            "with shape (N, >=4), "
+            f"got {x.shape}"
+        )
+
+    points = x[
+        :, :3
+    ].astype(
+        np.float64
+    )
+
+    rho0 = x[
+        :, 3
+    ].astype(
+        np.float64
+    )
+
+    print(
+        f"Loaded {len(points):,} "
+        "Gaussians."
+    )
+
+    print(
+        "Density range: "
+        f"[{rho0.min():.6f}, "
+        f"{rho0.max():.6f}]"
+    )
+
+    # --------------------------------------------------------
+    # Graph.
+    # --------------------------------------------------------
+
+    graph = build_graph(
+        points,
+        k=KNN,
+        weight_k=WEIGHT_K,
+    )
+
+    n_edges = len(
+        graph.weights
+    )
+
+    # --------------------------------------------------------
+    # Full reference.
+    # --------------------------------------------------------
+
+    print(
+        "\nRunning full optimization..."
+    )
+
+    (
+        rho_full,
+        full_curve,
+    ) = run_full_optimization(
+        rho0,
+        graph,
+    )
+
+    print(
+        f"Full final objective: "
+        f"{full_curve[-1]:.8f}"
+    )
+
+    # --------------------------------------------------------
+    # Exact optimum.
+    # --------------------------------------------------------
+
+    print(
+        "\nComputing exact CG optimum..."
+    )
+
+    i = graph.edges_i
+    j = graph.edges_j
+    w = graph.weights
+
+    n = len(
+        rho0
+    )
+
+    diag = np.zeros(
+        n,
+        dtype=np.float64,
+    )
+
+    np.add.at(
+        diag,
+        i,
+        w,
+    )
+
+    np.add.at(
+        diag,
+        j,
+        w,
+    )
+
+    rows = np.concatenate(
+        [
+            i,
+            j,
+            np.arange(n),
+        ]
+    )
+
+    cols = np.concatenate(
+        [
+            j,
+            i,
+            np.arange(n),
+        ]
+    )
+
+    vals = np.concatenate(
+        [
+            -2.0
+            * w
+            * LAMBDA,
+
+            -2.0
+            * w
+            * LAMBDA,
+
+            1.0
+            + 2.0
+            * LAMBDA
+            * diag,
+        ]
+    )
+
+    A = coo_matrix(
+        (
+            vals,
+            (rows, cols),
+        ),
+        shape=(
+            n,
+            n,
+        ),
+    ).tocsr()
+
+    rho_star, info = cg(
+        A,
+        rho0,
+        maxiter=500,
+        rtol=1e-8,
+    )
+
+    if info != 0:
+
+        print(
+            f"WARNING: CG info = {info}"
+        )
+
+    exact_obj = objective(
+        rho_star,
+        rho0,
+        graph,
+        LAMBDA,
+    )
+
+    print(
+        f"Exact CG optimum: "
+        f"{exact_obj:.8f}"
+    )
+
+    # --------------------------------------------------------
+    # Strategies.
+    # --------------------------------------------------------
+
+    strategies = [
+        "highD_farthest",
+        "random",
+    ]
+
+    print(
+        "\nStrategies:"
+    )
+
+    print(
+        "  - highD_farthest"
+    )
+
+    print(
+        "      top 10% disagreement "
+        "+ greedy farthest-point sampling"
+    )
+
+    print(
+        "  - random"
+    )
+
+    # --------------------------------------------------------
+    # Results.
+    # --------------------------------------------------------
+
+    results = {
+        "full_curve": full_curve,
+        "exact_optimum": np.array(
+            [exact_obj]
+        ),
+    }
+
+    # --------------------------------------------------------
+    # Run budgets.
+    # --------------------------------------------------------
+
+    for target_edges in (
+        TARGET_EDGE_BUDGETS
+    ):
+
+        print(
+            "\n"
+            + "=" * 70
+        )
+
+        print(
+            f"TARGET EDGE BUDGET = "
+            f"{target_edges:,}"
+        )
+
+        print(
+            "=" * 70
+        )
+
+        for strategy in strategies:
+
+            print(
+                f"\n--- {strategy} ---"
+            )
+
+            curves = []
+            final_objectives = []
+            final_distances = []
+            mean_edges = []
+            mean_spread = []
+            mean_regions = []
+            mean_centers = []
+            calibrated_centers = []
+
+            if strategy == "random":
+
+                seeds = (
+                    RANDOM_SEEDS
+                )
+
+            else:
+
+                seeds = [0]
+
+            for seed in seeds:
+
+                result = (
+                    run_pebbled_optimization(
+                        rho0=rho0,
+                        graph=graph,
+                        strategy=strategy,
+                        target_edges=target_edges,
+                        seed=seed,
+                    )
+                )
+
+                curves.append(
+                    result[
+                        "objectives"
+                    ]
+                )
+
+                final_objectives.append(
+                    result[
+                        "objectives"
+                    ][-1]
+                )
+
+                final_distances.append(
+                    np.linalg.norm(
+                        result["rho"]
+                        - rho_star
+                    )
+                )
+
+                mean_edges.append(
+                    result[
+                        "edge_counts"
+                    ].mean()
+                )
+
+                mean_spread.append(
+                    result[
+                        "spread_values"
+                    ].mean()
+                )
+
+                mean_regions.append(
+                    result[
+                        "region_counts"
+                    ].mean()
+                )
+
+                mean_centers.append(
+                    result[
+                        "center_counts"
+                    ].mean()
+                )
+
+                calibrated_centers.append(
+                    result[
+                        "n_centers"
+                    ]
+                )
+
+            curves = np.asarray(
+                curves
+            )
+
+            mean_final = float(
+                np.mean(
+                    final_objectives
+                )
+            )
+
+            std_final = float(
+                np.std(
+                    final_objectives
+                )
+            )
+
+            mean_distance = float(
+                np.mean(
+                    final_distances
+                )
+            )
+
+            std_distance = float(
+                np.std(
+                    final_distances
+                )
+            )
+
+            mean_edge_value = float(
+                np.mean(
+                    mean_edges
+                )
+            )
+
+            std_edge_value = float(
+                np.std(
+                    mean_edges
+                )
+            )
+
+            mean_spread_value = float(
+                np.mean(
+                    mean_spread
+                )
+            )
+
+            std_spread_value = float(
+                np.std(
+                    mean_spread
+                )
+            )
+
+            mean_region_value = float(
+                np.mean(
+                    mean_regions
+                )
+            )
+
+            mean_center_value = float(
+                np.mean(
+                    mean_centers
+                )
+            )
+
+            edge_saving = (
+                100.0
+                * (
+                    1.0
+                    - mean_edge_value
+                    / n_edges
+                )
+            )
+
+            # ------------------------------------------------
+            # Print summary.
+            # ------------------------------------------------
+
+            print(
+                "final objective: "
+                f"{mean_final:.8f}"
+                + (
+                    f" ± {std_final:.8f}"
+                    if len(seeds) > 1
+                    else ""
+                )
+            )
+
+            print(
+                "distance to exact optimum: "
+                f"{mean_distance:.8f}"
+                + (
+                    f" ± {std_distance:.8f}"
+                    if len(seeds) > 1
+                    else ""
+                )
+            )
+
+            print(
+                "mean touched edges: "
+                f"{mean_edge_value:.2f}"
+                + (
+                    f" ± {std_edge_value:.2f}"
+                    if len(seeds) > 1
+                    else ""
+                )
+            )
+
+            print(
+                "mean edge saving: "
+                f"{edge_saving:.4f}%"
+            )
+
+            print(
+                "mean pebble centers: "
+                f"{mean_center_value:.2f}"
+            )
+
+            print(
+                "mean region nodes: "
+                f"{mean_region_value:.2f}"
+            )
+
+            print(
+                "mean nearest-center distance: "
+                f"{mean_spread_value:.6f}"
+                + (
+                    f" ± {std_spread_value:.6f}"
+                    if len(seeds) > 1
+                    else ""
+                )
+            )
+
+            print(
+                "calibrated center count: "
+                f"{calibrated_centers}"
+            )
+
+            # ------------------------------------------------
+            # Save.
+            # ------------------------------------------------
+
+            key = (
+                f"{strategy}_{target_edges}"
+            )
+
+            results[
+                f"{key}_curves"
+            ] = curves
+
+            results[
+                f"{key}_final_objective"
+            ] = np.asarray(
+                final_objectives
+            )
+
+            results[
+                f"{key}_distance"
+            ] = np.asarray(
+                final_distances
+            )
+
+            results[
+                f"{key}_mean_edges"
+            ] = np.asarray(
+                mean_edges
+            )
+
+            results[
+                f"{key}_mean_spread"
+            ] = np.asarray(
+                mean_spread
+            )
+
+            results[
+                f"{key}_mean_region"
+            ] = np.asarray(
+                mean_regions
+            )
+
+            results[
+                f"{key}_mean_centers"
+            ] = np.asarray(
+                mean_centers
+            )
+
+            results[
+                f"{key}_calibrated_centers"
+            ] = np.asarray(
+                calibrated_centers
+            )
+
+    # --------------------------------------------------------
+    # Save everything.
+    # --------------------------------------------------------
+
+    np.savez_compressed(
+        OUT_PATH,
+        **results,
+    )
+
+    print(
+        "\n"
+        + "=" * 70
+    )
+
+    print(
+        "Saved results to:"
+    )
+
+    print(
+        OUT_PATH
+    )
+
+    print(
+        "=" * 70
+    )
+
+
+if __name__ == "__main__":
+    main()

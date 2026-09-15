@@ -1,0 +1,317 @@
+import csv
+from pathlib import Path
+
+import numpy as np
+from scipy.spatial import cKDTree
+
+
+K = 6
+WEIGHT_K = 6.0
+BUDGETS_PCT = [1, 2, 5, 10, 20]
+RANDOM_SEEDS = list(range(20))
+
+DATASET = Path(
+    "~/r2_gaussian/data/synthetic_dataset/"
+    "cone_ntrain_50_angle_360/0_chest_cone/"
+    "init_0_chest_cone.npy"
+).expanduser()
+
+OUT = Path("~/r2_gaussian/experiments").expanduser()
+OUT.mkdir(parents=True, exist_ok=True)
+
+
+def build_symmetric_knn(points, k):
+    tree = cKDTree(points)
+    _, nbrs = tree.query(points, k=k + 1)
+    nbrs = nbrs[:, 1:]
+
+    edges = set()
+
+    for i in range(len(points)):
+        for j in nbrs[i]:
+            i = int(i)
+            j = int(j)
+
+            if i == j:
+                continue
+
+            edges.add((min(i, j), max(i, j)))
+
+    return np.asarray(sorted(edges), dtype=np.int64), nbrs
+
+
+def compute_weights(points, rho, edges, k):
+    i = edges[:, 0]
+    j = edges[:, 1]
+
+    d = points[i] - points[j]
+    dist2 = np.sum(d * d, axis=1)
+
+    weights = np.exp(-dist2 / k)
+    rho_diff = rho[i] - rho[j]
+
+    energy = weights * rho_diff**2
+
+    return weights, energy
+
+
+def expand_region(selected, knn):
+    region = np.unique(
+        np.concatenate(
+            [selected, knn[selected].reshape(-1)]
+        )
+    )
+    return region
+
+
+def touched_energy(region, edges, edge_energy):
+    inside = np.zeros(
+        int(edges.max()) + 1,
+        dtype=bool,
+    )
+    inside[region] = True
+
+    i = edges[:, 0]
+    j = edges[:, 1]
+
+    mask = inside[i] | inside[j]
+
+    return int(mask.sum()), float(edge_energy[mask].sum())
+
+
+def main():
+    print("Loading:", DATASET)
+
+    x = np.load(DATASET, allow_pickle=False)
+
+    points = x[:, :3].astype(np.float64)
+    rho = x[:, 3].astype(np.float64)
+
+    n = len(points)
+
+    print("Nodes:", n)
+    print("KNN K:", K)
+    print("Weight denominator:", WEIGHT_K)
+
+    edges, knn = build_symmetric_knn(points, K)
+    weights, edge_energy = compute_weights(
+        points, rho, edges, WEIGHT_K
+    )
+
+    full_edges = len(edges)
+    full_energy = float(edge_energy.sum())
+
+    print("Unique undirected edges:", full_edges)
+    print("Full weighted energy:", full_energy)
+
+    # ---------------------------------------------------------
+    # NODE SCORES
+    # ---------------------------------------------------------
+
+    energy_score = np.zeros(n)
+    weighted_degree = np.zeros(n)
+
+    i = edges[:, 0]
+    j = edges[:, 1]
+
+    np.add.at(energy_score, i, edge_energy)
+    np.add.at(energy_score, j, edge_energy)
+
+    np.add.at(weighted_degree, i, weights)
+    np.add.at(weighted_degree, j, weights)
+
+    energy_rank = np.argsort(energy_score)[::-1]
+    degree_rank = np.argsort(weighted_degree)[::-1]
+
+    # ---------------------------------------------------------
+    # ADAPTIVE / DEGREE
+    # ---------------------------------------------------------
+
+    summary = []
+
+    for pct in BUDGETS_PCT:
+        selected_count = max(
+            1,
+            int(round(n * pct / 100.0)),
+        )
+
+        for method, ranking in [
+            ("adaptive", energy_rank),
+            ("weighted_degree", degree_rank),
+        ]:
+            selected = ranking[:selected_count]
+            region = expand_region(selected, knn)
+
+            touched_edges, captured_energy = touched_energy(
+                region,
+                edges,
+                edge_energy,
+            )
+
+            summary.append(
+                {
+                    "method": method,
+                    "budget_pct": pct,
+                    "selected_nodes": selected_count,
+                    "region_nodes": len(region),
+                    "touched_edges": touched_edges,
+                    "edge_fraction": touched_edges / full_edges,
+                    "work_saved": 1.0 - touched_edges / full_edges,
+                    "energy_captured": captured_energy,
+                    "energy_fraction": captured_energy / full_energy,
+                }
+            )
+
+    # ---------------------------------------------------------
+    # RANDOM BASELINE
+    # ---------------------------------------------------------
+
+    for pct in BUDGETS_PCT:
+        selected_count = max(
+            1,
+            int(round(n * pct / 100.0)),
+        )
+
+        for seed in RANDOM_SEEDS:
+            rng = np.random.default_rng(seed)
+
+            selected = rng.choice(
+                n,
+                size=selected_count,
+                replace=False,
+            )
+
+            region = expand_region(selected, knn)
+
+            touched_edges, captured_energy = touched_energy(
+                region,
+                edges,
+                edge_energy,
+            )
+
+            summary.append(
+                {
+                    "method": "random",
+                    "budget_pct": pct,
+                    "selected_nodes": selected_count,
+                    "region_nodes": len(region),
+                    "touched_edges": touched_edges,
+                    "edge_fraction": touched_edges / full_edges,
+                    "work_saved": 1.0 - touched_edges / full_edges,
+                    "energy_captured": captured_energy,
+                    "energy_fraction": captured_energy / full_energy,
+                    "seed": seed,
+                }
+            )
+
+    # ---------------------------------------------------------
+    # PRINT COMPARISON
+    # ---------------------------------------------------------
+
+    print("\nADAPTIVE VS WEIGHTED DEGREE")
+    print(
+        "method            pct   edges      edge_frac   "
+        "energy_frac   work_saved"
+    )
+    print("-" * 85)
+
+    for row in summary:
+        if row["method"] == "random":
+            continue
+
+        print(
+            f"{row['method']:<18}"
+            f"{row['budget_pct']:>3}%  "
+            f"{row['touched_edges']:>8,}  "
+            f"{row['edge_fraction']:.6f}    "
+            f"{row['energy_fraction']:.6f}      "
+            f"{100 * row['work_saved']:.3f}%"
+        )
+
+    # Random means/std.
+    print("\nRANDOM MEAN ± STD")
+    print(
+        "pct   edges        edge_frac    "
+        "energy_frac       work_saved"
+    )
+    print("-" * 75)
+
+    for pct in BUDGETS_PCT:
+        rows = [
+            r for r in summary
+            if r["method"] == "random"
+            and r["budget_pct"] == pct
+        ]
+
+        edge_mean = np.mean(
+            [r["touched_edges"] for r in rows]
+        )
+        edge_std = np.std(
+            [r["touched_edges"] for r in rows]
+        )
+
+        edge_frac_mean = np.mean(
+            [r["edge_fraction"] for r in rows]
+        )
+        edge_frac_std = np.std(
+            [r["edge_fraction"] for r in rows]
+        )
+
+        energy_mean = np.mean(
+            [r["energy_fraction"] for r in rows]
+        )
+        energy_std = np.std(
+            [r["energy_fraction"] for r in rows]
+        )
+
+        work_mean = np.mean(
+            [r["work_saved"] for r in rows]
+        )
+        work_std = np.std(
+            [r["work_saved"] for r in rows]
+        )
+
+        print(
+            f"{pct:>3}%  "
+            f"{edge_mean:>8.1f}±{edge_std:.1f}  "
+            f"{edge_frac_mean:.6f}±{edge_frac_std:.6f}  "
+            f"{energy_mean:.6f}±{energy_std:.6f}  "
+            f"{100 * work_mean:.3f}%±{100 * work_std:.3f}%"
+        )
+
+    # ---------------------------------------------------------
+    # SAVE
+    # ---------------------------------------------------------
+
+    path = OUT / "energy_vs_edge_budget.csv"
+
+    fieldnames = [
+        "method",
+        "budget_pct",
+        "selected_nodes",
+        "region_nodes",
+        "touched_edges",
+        "edge_fraction",
+        "work_saved",
+        "energy_captured",
+        "energy_fraction",
+        "seed",
+    ]
+
+    with path.open("w", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=fieldnames,
+        )
+        writer.writeheader()
+
+        for row in summary:
+            for key in fieldnames:
+                row.setdefault(key, "")
+            writer.writerow(row)
+
+    print("\nSaved:", path)
+
+
+if __name__ == "__main__":
+    main()

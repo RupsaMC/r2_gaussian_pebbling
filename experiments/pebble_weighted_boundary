@@ -1,0 +1,378 @@
+import time
+from pathlib import Path
+
+import numpy as np
+from scipy.spatial import cKDTree
+from scipy.sparse import csr_matrix
+
+
+K = 6
+WEIGHT_K = 6.0
+
+DATASET = Path(
+    "~/r2_gaussian/data/synthetic_dataset/"
+    "cone_ntrain_50_angle_360/0_chest_cone/"
+    "init_0_chest_cone.npy"
+).expanduser()
+
+
+def build_symmetric_knn(points, k):
+    """Build an undirected graph from directed KNN queries."""
+    tree = cKDTree(points)
+    _, nbrs = tree.query(points, k=k + 1)
+    nbrs = nbrs[:, 1:]
+
+    edges = set()
+
+    for i in range(points.shape[0]):
+        for j in nbrs[i]:
+            i = int(i)
+            j = int(j)
+
+            if i == j:
+                continue
+
+            edges.add(tuple(sorted((i, j))))
+
+    return np.asarray(sorted(edges), dtype=np.int64)
+
+
+def weighted_edges(points, rho, edges, k):
+    """Compute Gaussian graph weights and edge energies."""
+    i = edges[:, 0]
+    j = edges[:, 1]
+
+    diff_xyz = points[i] - points[j]
+    dist2 = np.sum(diff_xyz * diff_xyz, axis=1)
+
+    weights = np.exp(-dist2 / k)
+
+    diff_rho = rho[i] - rho[j]
+
+    edge_energy = weights * (diff_rho ** 2)
+
+    return weights, diff_rho, edge_energy
+
+
+def weighted_laplacian_action(n, edges, weights, rho):
+    """Full weighted Laplacian action L_w rho."""
+    i = edges[:, 0]
+    j = edges[:, 1]
+
+    diff = rho[i] - rho[j]
+    contribution = weights * diff
+
+    rows = np.concatenate([i, j])
+    cols = np.concatenate([i, j])
+    data = np.concatenate([contribution, -contribution])
+
+    Lrho = np.zeros(n, dtype=np.float64)
+    np.add.at(Lrho, i, contribution)
+    np.add.at(Lrho, j, -contribution)
+
+    return Lrho
+
+
+def main():
+    print(f"Loading: {DATASET}")
+
+    x = np.load(DATASET, allow_pickle=False)
+
+    points = x[:, :3].astype(np.float64)
+    rho = x[:, 3].astype(np.float64)
+
+    n = points.shape[0]
+
+    print(f"Nodes: {n}")
+    print(f"KNN K: {K}")
+    print(f"Weight denominator k: {WEIGHT_K}")
+    print(
+        f"Density range: "
+        f"[{rho.min():.6g}, {rho.max():.6g}]"
+    )
+
+    # =========================================================
+    # GRAPH
+    # =========================================================
+
+    t0 = time.perf_counter()
+
+    edges = build_symmetric_knn(points, K)
+    weights, diff_rho, edge_energy = weighted_edges(
+        points,
+        rho,
+        edges,
+        WEIGHT_K,
+    )
+
+    graph_time = time.perf_counter() - t0
+
+    print("\nGRAPH")
+    print(f"Unique undirected edges: {len(edges):,}")
+    print(f"Graph construction time: {graph_time:.4f} s")
+
+    # =========================================================
+    # FULL WEIGHTED LAPLACIAN
+    # =========================================================
+
+    t0 = time.perf_counter()
+
+    full_action = weighted_laplacian_action(
+        n,
+        edges,
+        weights,
+        rho,
+    )
+
+    full_action_time = time.perf_counter() - t0
+
+    full_energy = float(edge_energy.sum())
+
+    print("\nFULL WEIGHTED GRAPH")
+    print(f"Laplacian energy: {full_energy:.8e}")
+    print(f"Action time: {full_action_time:.6f} s")
+
+    # =========================================================
+    # ADAPTIVE PEBBLE SCORE
+    #
+    # Score matches the weighted Laplacian energy:
+    #
+    # S_i = sum_j w_ij (rho_i - rho_j)^2
+    # =========================================================
+
+    scores = np.zeros(n, dtype=np.float64)
+
+    i = edges[:, 0]
+    j = edges[:, 1]
+
+    np.add.at(scores, i, edge_energy)
+    np.add.at(scores, j, edge_energy)
+
+    pebble = int(np.argmax(scores))
+
+    # =========================================================
+    # PEBBLE REGION
+    # =========================================================
+
+    region = {pebble}
+
+    for a, b in edges:
+        if a == pebble:
+            region.add(int(b))
+        elif b == pebble:
+            region.add(int(a))
+
+    region = np.array(sorted(region), dtype=np.int64)
+    region_set = set(region.tolist())
+
+    # =========================================================
+    # SPLIT GRAPH INTO:
+    #
+    #   internal edges: both endpoints in H
+    #   boundary edges: exactly one endpoint in H
+    # =========================================================
+
+    internal_mask = np.array(
+        [
+            int(a) in region_set and int(b) in region_set
+            for a, b in edges
+        ],
+        dtype=bool,
+    )
+
+    boundary_mask = np.array(
+        [
+            (int(a) in region_set) != (int(b) in region_set)
+            for a, b in edges
+        ],
+        dtype=bool,
+    )
+
+    internal_edges = edges[internal_mask]
+    boundary_edges = edges[boundary_mask]
+
+    internal_weights = weights[internal_mask]
+    boundary_weights = weights[boundary_mask]
+
+    # =========================================================
+    # TOY-STYLE INDUCED PEBBLE
+    #
+    # Only edges fully inside the region.
+    # =========================================================
+
+    toy_action = np.zeros(len(region), dtype=np.float64)
+
+    local_index = {
+        int(node): idx
+        for idx, node in enumerate(region)
+    }
+
+    for (a, b), w in zip(
+        internal_edges,
+        internal_weights,
+    ):
+        a = int(a)
+        b = int(b)
+
+        ia = local_index[a]
+        ib = local_index[b]
+
+        d = w * (rho[a] - rho[b])
+
+        toy_action[ia] += d
+        toy_action[ib] -= d
+
+    global_region_action = full_action[region]
+
+    toy_abs_error = np.linalg.norm(
+        toy_action - global_region_action
+    )
+
+    toy_relative_error = (
+        toy_abs_error
+        / max(np.linalg.norm(global_region_action), 1e-12)
+    )
+
+    # =========================================================
+    # BOUNDARY-AWARE PEBBLE
+    #
+    # Internal edges contribute to both local endpoints.
+    # Boundary edges contribute only to the endpoint inside H.
+    #
+    # This exactly reproduces the restricted global
+    # Laplacian action using only edges touching H.
+    # =========================================================
+
+    boundary_action = np.zeros(len(region), dtype=np.float64)
+
+    for (a, b), w in zip(
+        internal_edges,
+        internal_weights,
+    ):
+        a = int(a)
+        b = int(b)
+
+        ia = local_index[a]
+        ib = local_index[b]
+
+        d = w * (rho[a] - rho[b])
+
+        boundary_action[ia] += d
+        boundary_action[ib] -= d
+
+    for (a, b), w in zip(
+        boundary_edges,
+        boundary_weights,
+    ):
+        a = int(a)
+        b = int(b)
+
+        if a in region_set:
+            inside = a
+            outside = b
+        else:
+            inside = b
+            outside = a
+
+        ii = local_index[inside]
+
+        d = w * (rho[inside] - rho[outside])
+
+        boundary_action[ii] += d
+
+    boundary_abs_error = np.linalg.norm(
+        boundary_action - global_region_action
+    )
+
+    boundary_relative_error = (
+        boundary_abs_error
+        / max(np.linalg.norm(global_region_action), 1e-12)
+    )
+
+    # =========================================================
+    # WORK
+    # =========================================================
+
+    full_work = len(edges)
+
+    toy_work = len(internal_edges)
+
+    boundary_work = (
+        len(internal_edges)
+        + len(boundary_edges)
+    )
+
+    print("\nPEBBLE")
+    print(f"Pebble node: {pebble}")
+    print(f"Pebble score: {scores[pebble]:.8e}")
+    print(f"Region nodes: {len(region)}")
+
+    print("\nEDGE BREAKDOWN")
+    print(f"Internal edges: {len(internal_edges):,}")
+    print(f"Boundary edges: {len(boundary_edges):,}")
+    print(
+        f"Edges touching region: "
+        f"{boundary_work:,}"
+    )
+
+    print("\nTOY INDUCED PEBBLE")
+    print(f"Work ratio: {toy_work / full_work:.8f}")
+    print(
+        f"Work saved: "
+        f"{100.0 * (1.0 - toy_work / full_work):.4f}%"
+    )
+    print(
+        f"Relative action error: "
+        f"{toy_relative_error:.8e}"
+    )
+
+    print("\nBOUNDARY-AWARE PEBBLE")
+    print(
+        f"Work ratio: "
+        f"{boundary_work / full_work:.8f}"
+    )
+    print(
+        f"Work saved: "
+        f"{100.0 * (1.0 - boundary_work / full_work):.4f}%"
+    )
+    print(
+        f"Relative action error: "
+        f"{boundary_relative_error:.8e}"
+    )
+
+    print("\nWEIGHTED ENERGY")
+    print(
+        f"Full graph energy: "
+        f"{full_energy:.8e}"
+    )
+
+    toy_energy = float(
+        sum(
+            w * (rho[a] - rho[b]) ** 2
+            for (a, b), w in zip(
+                internal_edges,
+                internal_weights,
+            )
+        )
+    )
+
+    print(
+        f"Toy induced energy: "
+        f"{toy_energy:.8e}"
+    )
+
+    print(
+        f"Toy retained energy: "
+        f"{toy_energy / max(full_energy, 1e-12):.8f}"
+    )
+
+    print("\nSANITY CHECK")
+    print(
+        "The boundary-aware action should match the "
+        "global Laplacian action on the selected region "
+        "up to floating-point error."
+    )
+
+
+if __name__ == "__main__":
+    main()

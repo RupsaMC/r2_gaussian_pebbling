@@ -1,0 +1,329 @@
+import csv
+import time
+from pathlib import Path
+
+import numpy as np
+from scipy.spatial import cKDTree
+
+
+K = 6
+WEIGHT_K = 6.0
+PEBBLE_PCTS = [1, 5, 10, 20]
+
+DATASET = Path(
+    "~/r2_gaussian/data/synthetic_dataset/"
+    "cone_ntrain_50_angle_360/0_chest_cone/"
+    "init_0_chest_cone.npy"
+).expanduser()
+
+OUT = Path("~/r2_gaussian/experiments").expanduser()
+OUT.mkdir(parents=True, exist_ok=True)
+
+
+def build_symmetric_knn(points, k):
+    tree = cKDTree(points)
+    _, nbrs = tree.query(points, k=k + 1)
+    nbrs = nbrs[:, 1:]
+
+    edges = set()
+
+    for i in range(points.shape[0]):
+        for j in nbrs[i]:
+            i = int(i)
+            j = int(j)
+
+            if i == j:
+                continue
+
+            edges.add((min(i, j), max(i, j)))
+
+    return np.asarray(sorted(edges), dtype=np.int64), nbrs
+
+
+def weighted_edges(points, rho, edges, k):
+    i = edges[:, 0]
+    j = edges[:, 1]
+
+    d = points[i] - points[j]
+    dist2 = np.sum(d * d, axis=1)
+
+    weights = np.exp(-dist2 / k)
+
+    rho_diff = rho[i] - rho[j]
+
+    energy = weights * rho_diff**2
+
+    return weights, rho_diff, energy
+
+
+def weighted_action(n, edges, weights, rho):
+    """Compute full weighted Laplacian action L_w rho."""
+    action = np.zeros(n, dtype=np.float64)
+
+    i = edges[:, 0]
+    j = edges[:, 1]
+
+    contribution = weights * (rho[i] - rho[j])
+
+    np.add.at(action, i, contribution)
+    np.add.at(action, j, -contribution)
+
+    return action
+
+
+def region_action(region, edges, weights, rho):
+    """
+    Exact global Laplacian action on the selected region,
+    using every edge touching that region.
+
+    Internal edges contribute to both endpoints.
+    Boundary edges contribute only to the endpoint inside.
+    """
+    n = rho.shape[0]
+
+    inside = np.zeros(n, dtype=bool)
+    inside[region] = True
+
+    i = edges[:, 0]
+    j = edges[:, 1]
+
+    touched = inside[i] | inside[j]
+
+    e = edges[touched]
+    w = weights[touched]
+
+    a = e[:, 0]
+    b = e[:, 1]
+
+    action = np.zeros(len(region), dtype=np.float64)
+
+    local_index = {
+        int(node): idx
+        for idx, node in enumerate(region)
+    }
+
+    for (u, v), weight in zip(e, w):
+        u = int(u)
+        v = int(v)
+
+        if inside[u] and inside[v]:
+            d = weight * (rho[u] - rho[v])
+
+            action[local_index[u]] += d
+            action[local_index[v]] -= d
+
+        elif inside[u]:
+            d = weight * (rho[u] - rho[v])
+            action[local_index[u]] += d
+
+        else:
+            d = weight * (rho[v] - rho[u])
+            action[local_index[v]] += d
+
+    return action, touched
+
+
+def main():
+    print(f"Loading: {DATASET}")
+
+    x = np.load(DATASET, allow_pickle=False)
+
+    if x.ndim != 2 or x.shape[1] < 4:
+        raise ValueError(f"Expected (N, >=4), got {x.shape}")
+
+    points = x[:, :3].astype(np.float64, copy=False)
+    rho = x[:, 3].astype(np.float64, copy=False)
+
+    n = len(points)
+
+    print(f"Nodes: {n}")
+    print(f"KNN K: {K}")
+    print(f"Weight denominator k: {WEIGHT_K}")
+    print(
+        f"Density range: "
+        f"[{rho.min():.6g}, {rho.max():.6g}]"
+    )
+
+    # ---------------------------------------------------------
+    # GRAPH
+    # ---------------------------------------------------------
+
+    t0 = time.perf_counter()
+
+    edges, knn = build_symmetric_knn(points, K)
+    weights, rho_diff, edge_energy = weighted_edges(
+        points, rho, edges, WEIGHT_K
+    )
+
+    graph_time = time.perf_counter() - t0
+
+    full_edges = len(edges)
+    full_energy = float(edge_energy.sum())
+
+    print("\nGRAPH")
+    print(f"Unique undirected edges: {full_edges:,}")
+    print(f"Graph construction time: {graph_time:.4f} s")
+
+    # ---------------------------------------------------------
+    # FULL LAPLACIAN ACTION
+    # ---------------------------------------------------------
+
+    t0 = time.perf_counter()
+
+    full_action = weighted_action(
+        n, edges, weights, rho
+    )
+
+    full_action_time = time.perf_counter() - t0
+
+    print("\nFULL WEIGHTED GRAPH")
+    print(f"Full energy: {full_energy:.8e}")
+    print(f"Full action time: {full_action_time:.6f} s")
+
+    # ---------------------------------------------------------
+    # ADAPTIVE NODE SCORES
+    # ---------------------------------------------------------
+
+    scores = np.zeros(n, dtype=np.float64)
+
+    i = edges[:, 0]
+    j = edges[:, 1]
+
+    np.add.at(scores, i, edge_energy)
+    np.add.at(scores, j, edge_energy)
+
+    ranking = np.argsort(scores)[::-1]
+
+    results = []
+
+    print("\nMULTI-PEBBLE RESULTS")
+    print(
+        "pct | selected | region | touched_edges | "
+        "work_saved | energy_captured | action_error"
+    )
+    print("-" * 100)
+
+    for pct in PEBBLE_PCTS:
+        selected_count = max(
+            1,
+            int(round(n * pct / 100.0))
+        )
+
+        selected = ranking[:selected_count]
+
+        # Union of selected nodes + their KNN neighbors.
+        region = np.unique(
+            np.concatenate(
+                [
+                    selected,
+                    knn[selected].reshape(-1),
+                ]
+            )
+        )
+
+        region.sort()
+
+        # -----------------------------------------------------
+        # EXACT GLOBAL ACTION ON THIS REGION
+        # -----------------------------------------------------
+
+        region_action_vec, touched_mask = region_action(
+            region,
+            edges,
+            weights,
+            rho,
+        )
+
+        global_region_action = full_action[region]
+
+        action_error = np.linalg.norm(
+            region_action_vec - global_region_action
+        )
+
+        action_norm = np.linalg.norm(
+            global_region_action
+        )
+
+        relative_action_error = (
+            action_error
+            / max(action_norm, 1e-12)
+        )
+
+        # -----------------------------------------------------
+        # ENERGY COVERAGE
+        # -----------------------------------------------------
+
+        touched_energy = float(
+            edge_energy[touched_mask].sum()
+        )
+
+        energy_fraction = (
+            touched_energy
+            / max(full_energy, 1e-12)
+        )
+
+        touched_edges = int(
+            touched_mask.sum()
+        )
+
+        work_fraction = touched_edges / full_edges
+        work_saved = 1.0 - work_fraction
+
+        region_fraction = len(region) / n
+
+        results.append(
+            {
+                "pebble_pct": pct,
+                "selected_nodes": selected_count,
+                "region_nodes": len(region),
+                "region_fraction": region_fraction,
+                "touched_edges": touched_edges,
+                "work_fraction": work_fraction,
+                "work_saved": work_saved,
+                "touched_energy": touched_energy,
+                "energy_fraction": energy_fraction,
+                "relative_action_error": relative_action_error,
+            }
+        )
+
+        print(
+            f"{pct:>3}% | "
+            f"{selected_count:>8,} | "
+            f"{len(region):>6,} | "
+            f"{touched_edges:>13,} | "
+            f"{100 * work_saved:>10.4f}% | "
+            f"{energy_fraction:>15.6f} | "
+            f"{relative_action_error:.3e}"
+        )
+
+    # ---------------------------------------------------------
+    # SAVE
+    # ---------------------------------------------------------
+
+    csv_path = OUT / "multi_pebble_weighted_boundary.csv"
+
+    with csv_path.open("w", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=results[0].keys(),
+        )
+        writer.writeheader()
+        writer.writerows(results)
+
+    np.save(
+        OUT / "weighted_node_scores.npy",
+        scores,
+    )
+
+    print(f"\nSaved: {csv_path}")
+
+    print("\nINTERPRETATION")
+    print(
+        "Boundary-aware action error should be approximately zero "
+        "because all graph edges touching the selected region are "
+        "included."
+    )
+
+
+if __name__ == "__main__":
+    main()

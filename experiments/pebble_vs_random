@@ -1,0 +1,326 @@
+import csv
+import time
+from pathlib import Path
+
+import numpy as np
+from scipy.spatial import cKDTree
+
+
+K = 6
+WEIGHT_K = 6.0
+PEBBLE_PCTS = [1, 5, 10, 20]
+RANDOM_SEEDS = list(range(20))
+
+DATASET = Path(
+    "~/r2_gaussian/data/synthetic_dataset/"
+    "cone_ntrain_50_angle_360/0_chest_cone/"
+    "init_0_chest_cone.npy"
+).expanduser()
+
+OUT = Path("~/r2_gaussian/experiments").expanduser()
+OUT.mkdir(parents=True, exist_ok=True)
+
+
+def build_symmetric_knn(points, k):
+    tree = cKDTree(points)
+    _, nbrs = tree.query(points, k=k + 1)
+    nbrs = nbrs[:, 1:]
+
+    edges = set()
+
+    for i in range(points.shape[0]):
+        for j in nbrs[i]:
+            i = int(i)
+            j = int(j)
+
+            if i == j:
+                continue
+
+            edges.add((min(i, j), max(i, j)))
+
+    return np.asarray(sorted(edges), dtype=np.int64), nbrs
+
+
+def weighted_edges(points, rho, edges, k):
+    i = edges[:, 0]
+    j = edges[:, 1]
+
+    d = points[i] - points[j]
+    dist2 = np.sum(d * d, axis=1)
+
+    weights = np.exp(-dist2 / k)
+    rho_diff = rho[i] - rho[j]
+    energy = weights * rho_diff**2
+
+    return weights, energy
+
+
+def region_from_selected(selected, knn):
+    region = np.unique(
+        np.concatenate(
+            [selected, knn[selected].reshape(-1)]
+        )
+    )
+    region.sort()
+    return region
+
+
+def touched_mask_for_region(region, edges):
+    inside = np.zeros(
+        int(edges.max()) + 1,
+        dtype=bool
+    )
+    inside[region] = True
+
+    i = edges[:, 0]
+    j = edges[:, 1]
+
+    return inside[i] | inside[j]
+
+
+def evaluate_region(region, edges, edge_energy, full_energy):
+    mask = touched_mask_for_region(region, edges)
+
+    touched_edges = int(mask.sum())
+    touched_energy = float(edge_energy[mask].sum())
+
+    work_fraction = touched_edges / len(edges)
+    work_saved = 1.0 - work_fraction
+
+    energy_fraction = (
+        touched_energy / max(full_energy, 1e-12)
+    )
+
+    return {
+        "region_nodes": int(len(region)),
+        "touched_edges": touched_edges,
+        "work_fraction": work_fraction,
+        "work_saved": work_saved,
+        "touched_energy": touched_energy,
+        "energy_fraction": energy_fraction,
+    }
+
+
+def main():
+    print(f"Loading: {DATASET}")
+
+    x = np.load(DATASET, allow_pickle=False)
+
+    points = x[:, :3].astype(np.float64, copy=False)
+    rho = x[:, 3].astype(np.float64, copy=False)
+
+    n = len(points)
+
+    print(f"Nodes: {n}")
+    print(f"KNN K: {K}")
+    print(f"Weight denominator k: {WEIGHT_K}")
+
+    # ---------------------------------------------------------
+    # GRAPH
+    # ---------------------------------------------------------
+
+    t0 = time.perf_counter()
+
+    edges, knn = build_symmetric_knn(points, K)
+    weights, edge_energy = weighted_edges(
+        points, rho, edges, WEIGHT_K
+    )
+
+    graph_time = time.perf_counter() - t0
+    full_energy = float(edge_energy.sum())
+
+    print("\nGRAPH")
+    print(f"Unique undirected edges: {len(edges):,}")
+    print(f"Full weighted energy: {full_energy:.8e}")
+    print(f"Graph construction time: {graph_time:.4f} s")
+
+    # ---------------------------------------------------------
+    # ADAPTIVE SCORES
+    # ---------------------------------------------------------
+
+    scores = np.zeros(n, dtype=np.float64)
+
+    i = edges[:, 0]
+    j = edges[:, 1]
+
+    np.add.at(scores, i, edge_energy)
+    np.add.at(scores, j, edge_energy)
+
+    ranking = np.argsort(scores)[::-1]
+
+    results = []
+
+    print("\nADAPTIVE PEBBLE")
+    print(
+        "pct | selected | region | touched_edges | "
+        "work_saved | energy_captured"
+    )
+    print("-" * 85)
+
+    for pct in PEBBLE_PCTS:
+        selected_count = max(
+            1,
+            int(round(n * pct / 100.0))
+        )
+
+        selected = ranking[:selected_count]
+        region = region_from_selected(selected, knn)
+
+        stats = evaluate_region(
+            region,
+            edges,
+            edge_energy,
+            full_energy,
+        )
+
+        row = {
+            "method": "adaptive",
+            "pebble_pct": pct,
+            "seed": "",
+            "selected_nodes": selected_count,
+            **stats,
+        }
+        results.append(row)
+
+        print(
+            f"{pct:>3}% | "
+            f"{selected_count:>8,} | "
+            f"{stats['region_nodes']:>6,} | "
+            f"{stats['touched_edges']:>13,} | "
+            f"{100 * stats['work_saved']:>10.4f}% | "
+            f"{stats['energy_fraction']:>15.6f}"
+        )
+
+    # ---------------------------------------------------------
+    # RANDOM CONTROL
+    # ---------------------------------------------------------
+
+    print("\nRANDOM CONTROL")
+    print(
+        "For each budget, 20 random node selections are used."
+    )
+
+    random_summary = []
+
+    for pct in PEBBLE_PCTS:
+        selected_count = max(
+            1,
+            int(round(n * pct / 100.0))
+        )
+
+        trial_stats = []
+
+        for seed in RANDOM_SEEDS:
+            rng = np.random.default_rng(seed)
+
+            selected = rng.choice(
+                n,
+                size=selected_count,
+                replace=False,
+            )
+
+            region = region_from_selected(
+                selected,
+                knn,
+            )
+
+            stats = evaluate_region(
+                region,
+                edges,
+                edge_energy,
+                full_energy,
+            )
+
+            trial_stats.append(stats)
+
+            results.append(
+                {
+                    "method": "random",
+                    "pebble_pct": pct,
+                    "seed": seed,
+                    "selected_nodes": selected_count,
+                    **stats,
+                }
+            )
+
+        region_mean = np.mean(
+            [x["region_nodes"] for x in trial_stats]
+        )
+        region_std = np.std(
+            [x["region_nodes"] for x in trial_stats]
+        )
+
+        edges_mean = np.mean(
+            [x["touched_edges"] for x in trial_stats]
+        )
+        edges_std = np.std(
+            [x["touched_edges"] for x in trial_stats]
+        )
+
+        work_mean = np.mean(
+            [x["work_saved"] for x in trial_stats]
+        )
+        work_std = np.std(
+            [x["work_saved"] for x in trial_stats]
+        )
+
+        energy_mean = np.mean(
+            [x["energy_fraction"] for x in trial_stats]
+        )
+        energy_std = np.std(
+            [x["energy_fraction"] for x in trial_stats]
+        )
+
+        random_summary.append(
+            {
+                "pebble_pct": pct,
+                "selected_nodes": selected_count,
+                "region_nodes_mean": region_mean,
+                "region_nodes_std": region_std,
+                "touched_edges_mean": edges_mean,
+                "touched_edges_std": edges_std,
+                "work_saved_mean": work_mean,
+                "work_saved_std": work_std,
+                "energy_fraction_mean": energy_mean,
+                "energy_fraction_std": energy_std,
+            }
+        )
+
+        print(
+            f"{pct:>3}% | "
+            f"region={region_mean:.1f}±{region_std:.1f} | "
+            f"edges={edges_mean:.1f}±{edges_std:.1f} | "
+            f"saved={100*work_mean:.3f}%±{100*work_std:.3f}% | "
+            f"energy={energy_mean:.6f}±{energy_std:.6f}"
+        )
+
+    # ---------------------------------------------------------
+    # SAVE RAW RESULTS
+    # ---------------------------------------------------------
+
+    raw_path = OUT / "pebble_vs_random_raw.csv"
+
+    with raw_path.open("w", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=results[0].keys(),
+        )
+        writer.writeheader()
+        writer.writerows(results)
+
+    summary_path = OUT / "pebble_vs_random_summary.csv"
+
+    with summary_path.open("w", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=random_summary[0].keys(),
+        )
+        writer.writeheader()
+        writer.writerows(random_summary)
+
+    print(f"\nSaved raw results: {raw_path}")
+    print(f"Saved random summary: {summary_path}")
+
+
+if __name__ == "__main__":
+    main()

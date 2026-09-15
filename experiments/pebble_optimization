@@ -1,0 +1,645 @@
+import csv
+from pathlib import Path
+
+import numpy as np
+from scipy.spatial import cKDTree
+from scipy.sparse import coo_matrix, eye
+from scipy.sparse.linalg import cg
+
+
+K = 6
+WEIGHT_K = 6.0
+
+LAMBDA = 1.0
+LR = 0.02
+STEPS = 200
+
+BUDGET_PCTS = [1, 5, 10]
+RANDOM_SEEDS = [0, 1, 2, 3, 4]
+
+DATASET = Path(
+    "~/r2_gaussian/data/synthetic_dataset/"
+    "cone_ntrain_50_angle_360/0_chest_cone/"
+    "init_0_chest_cone.npy"
+).expanduser()
+
+OUT = Path("~/r2_gaussian/experiments").expanduser()
+OUT.mkdir(parents=True, exist_ok=True)
+
+
+def build_graph(points, k):
+    tree = cKDTree(points)
+    _, nbrs = tree.query(points, k=k + 1)
+    nbrs = nbrs[:, 1:]
+
+    edges = set()
+
+    for i in range(len(points)):
+        for j in nbrs[i]:
+            i = int(i)
+            j = int(j)
+            if i == j:
+                continue
+            edges.add((min(i, j), max(i, j)))
+
+    edges = np.asarray(sorted(edges), dtype=np.int64)
+
+    return edges, nbrs
+
+
+def edge_weights(points, rho, edges, k):
+    i = edges[:, 0]
+    j = edges[:, 1]
+
+    d = points[i] - points[j]
+    dist2 = np.sum(d * d, axis=1)
+
+    weights = np.exp(-dist2 / k)
+
+    return weights
+
+
+def build_sparse_laplacian(n, edges, weights):
+    i = edges[:, 0]
+    j = edges[:, 1]
+
+    rows = np.concatenate([i, j, i, j])
+    cols = np.concatenate([j, i, i, j])
+    data = np.concatenate([
+        -weights,
+        -weights,
+        weights,
+        weights,
+    ])
+
+    return coo_matrix(
+        (data, (rows, cols)),
+        shape=(n, n),
+    ).tocsr()
+
+
+def objective(rho, rho0, edges, weights):
+    diff = rho[edges[:, 0]] - rho[edges[:, 1]]
+
+    data_term = 0.5 * np.sum((rho - rho0) ** 2)
+    graph_term = LAMBDA * np.sum(
+        weights * diff * diff
+    )
+
+    return data_term + graph_term
+
+
+def full_gradient(rho, rho0, L):
+    return (
+        (rho - rho0)
+        + 2.0 * LAMBDA * (L @ rho)
+    )
+
+
+def make_region(selected, knn):
+    region = np.unique(
+        np.concatenate([
+            selected,
+            knn[selected].reshape(-1),
+        ])
+    )
+    region.sort()
+    return region
+
+
+def pebble_gradient(
+    rho,
+    rho0,
+    region,
+    edges,
+    weights,
+):
+    """
+    Exact global weighted-Laplacian action on region
+    using only edges touching the region.
+
+    Outside nodes receive no update.
+    """
+
+    n = len(rho)
+
+    inside = np.zeros(n, dtype=bool)
+    inside[region] = True
+
+    i = edges[:, 0]
+    j = edges[:, 1]
+
+    touched = inside[i] | inside[j]
+
+    e = edges[touched]
+    w = weights[touched]
+
+    grad = np.zeros(len(region), dtype=np.float64)
+
+    local_index = {
+        int(node): idx
+        for idx, node in enumerate(region)
+    }
+
+    for (u, v), weight in zip(e, w):
+        u = int(u)
+        v = int(v)
+
+        if inside[u] and inside[v]:
+            d = weight * (rho[u] - rho[v])
+
+            grad[local_index[u]] += d
+            grad[local_index[v]] -= d
+
+        elif inside[u]:
+            d = weight * (rho[u] - rho[v])
+            grad[local_index[u]] += d
+
+        else:
+            d = weight * (rho[v] - rho[u])
+            grad[local_index[v]] += d
+
+    # Data-fit gradient only on the selected region.
+    grad += rho[region] - rho0[region]
+
+    return grad, touched.sum()
+
+
+def run_full(rho0, L, edges, weights, rho_star):
+    rho = rho0.copy()
+
+    trajectory = []
+
+    for step in range(STEPS):
+        grad = full_gradient(rho, rho0, L)
+        rho -= LR * grad
+
+        obj = objective(
+            rho, rho0, edges, weights
+        )
+
+        dist = np.linalg.norm(rho - rho_star)
+
+        trajectory.append((step + 1, obj, dist))
+
+    return rho, trajectory
+
+
+def run_adaptive(
+    rho0,
+    edges,
+    weights,
+    knn,
+    rho_star,
+    budget_pct,
+):
+    rho = rho0.copy()
+    n = len(rho)
+
+    history = []
+
+    for step in range(STEPS):
+        diff = rho[edges[:, 0]] - rho[edges[:, 1]]
+        edge_energy = weights * diff * diff
+
+        scores = np.zeros(n)
+        np.add.at(scores, edges[:, 0], edge_energy)
+        np.add.at(scores, edges[:, 1], edge_energy)
+
+        count = max(
+            1,
+            int(round(n * budget_pct / 100.0))
+        )
+
+        selected = np.argpartition(
+            scores,
+            -count,
+        )[-count:]
+
+        region = make_region(selected, knn)
+
+        grad_region, touched = pebble_gradient(
+            rho,
+            rho0,
+            region,
+            edges,
+            weights,
+        )
+
+        rho[region] -= LR * grad_region
+
+        obj = objective(
+            rho, rho0, edges, weights
+        )
+
+        dist = np.linalg.norm(rho - rho_star)
+
+        history.append(
+            (
+                step + 1,
+                obj,
+                dist,
+                len(region),
+                int(touched),
+            )
+        )
+
+    return rho, history
+
+
+def run_degree(
+    rho0,
+    edges,
+    weights,
+    knn,
+    rho_star,
+    budget_pct,
+):
+    rho = rho0.copy()
+    n = len(rho)
+
+    weighted_degree = np.zeros(n)
+
+    np.add.at(
+        weighted_degree,
+        edges[:, 0],
+        weights,
+    )
+    np.add.at(
+        weighted_degree,
+        edges[:, 1],
+        weights,
+    )
+
+    count = max(
+        1,
+        int(round(n * budget_pct / 100.0))
+    )
+
+    selected = np.argpartition(
+        weighted_degree,
+        -count,
+    )[-count:]
+
+    region = make_region(
+        selected,
+        knn,
+    )
+
+    history = []
+
+    for step in range(STEPS):
+        grad_region, touched = pebble_gradient(
+            rho,
+            rho0,
+            region,
+            edges,
+            weights,
+        )
+
+        rho[region] -= LR * grad_region
+
+        obj = objective(
+            rho, rho0, edges, weights
+        )
+
+        dist = np.linalg.norm(rho - rho_star)
+
+        history.append(
+            (
+                step + 1,
+                obj,
+                dist,
+                len(region),
+                int(touched),
+            )
+        )
+
+    return rho, history
+
+
+def run_random(
+    rho0,
+    edges,
+    weights,
+    knn,
+    rho_star,
+    budget_pct,
+    seed,
+):
+    rho = rho0.copy()
+    n = len(rho)
+
+    count = max(
+        1,
+        int(round(n * budget_pct / 100.0))
+    )
+
+    rng = np.random.default_rng(seed)
+
+    selected = rng.choice(
+        n,
+        size=count,
+        replace=False,
+    )
+
+    region = make_region(
+        selected,
+        knn,
+    )
+
+    history = []
+
+    for step in range(STEPS):
+        grad_region, touched = pebble_gradient(
+            rho,
+            rho0,
+            region,
+            edges,
+            weights,
+        )
+
+        rho[region] -= LR * grad_region
+
+        obj = objective(
+            rho, rho0, edges, weights
+        )
+
+        dist = np.linalg.norm(rho - rho_star)
+
+        history.append(
+            (
+                step + 1,
+                obj,
+                dist,
+                len(region),
+                int(touched),
+            )
+        )
+
+    return rho, history
+
+
+def main():
+    print("Loading:", DATASET)
+
+    x = np.load(
+        DATASET,
+        allow_pickle=False,
+    )
+
+    points = x[:, :3].astype(np.float64)
+    rho0 = x[:, 3].astype(np.float64)
+
+    n = len(rho0)
+
+    print("Nodes:", n)
+
+    # ---------------------------------------------------------
+    # GRAPH
+    # ---------------------------------------------------------
+
+    edges, knn = build_graph(
+        points,
+        K,
+    )
+
+    weights = edge_weights(
+        points,
+        rho0,
+        edges,
+        WEIGHT_K,
+    )
+
+    L = build_sparse_laplacian(
+        n,
+        edges,
+        weights,
+    )
+
+    print("Edges:", len(edges))
+    print("Laplacian nnz:", L.nnz)
+
+    # ---------------------------------------------------------
+    # FULL-GRAPH OPTIMUM
+    #
+    # (I + 2 lambda L) rho* = rho0
+    # ---------------------------------------------------------
+
+    A = eye(n, format="csr") + (
+        2.0 * LAMBDA * L
+    )
+
+    print("\nSolving full objective optimum...")
+
+    rho_star, info = cg(
+        A,
+        rho0,
+        rtol=1e-8,
+        atol=1e-10,
+        maxiter=2000,
+    )
+
+    print("CG info:", info)
+
+    optimum_obj = objective(
+        rho_star,
+        rho0,
+        edges,
+        weights,
+    )
+
+    print(
+        f"Full optimum objective: "
+        f"{optimum_obj:.8e}"
+    )
+
+    # ---------------------------------------------------------
+    # FULL OPTIMIZATION
+    # ---------------------------------------------------------
+
+    print("\nRunning full graph optimization...")
+
+    rho_full, full_history = run_full(
+        rho0,
+        L,
+        edges,
+        weights,
+        rho_star,
+    )
+
+    print(
+        f"Full final objective: "
+        f"{full_history[-1][1]:.8e}"
+    )
+
+    # ---------------------------------------------------------
+    # RESULTS
+    # ---------------------------------------------------------
+
+    rows = []
+
+    for pct in BUDGET_PCTS:
+        print(f"\n=== Budget {pct}% ===")
+
+        # Adaptive.
+        print("Adaptive...")
+        _, hist = run_adaptive(
+            rho0,
+            edges,
+            weights,
+            knn,
+            rho_star,
+            pct,
+        )
+
+        rows.append({
+            "method": "adaptive",
+            "budget_pct": pct,
+            "seed": "",
+            "final_objective": hist[-1][1],
+            "final_dist_to_optimum": hist[-1][2],
+            "region_nodes": hist[-1][3],
+            "touched_edges": hist[-1][4],
+        })
+
+        # Weighted degree.
+        print("Weighted degree...")
+        _, hist = run_degree(
+            rho0,
+            edges,
+            weights,
+            knn,
+            rho_star,
+            pct,
+        )
+
+        rows.append({
+            "method": "weighted_degree",
+            "budget_pct": pct,
+            "seed": "",
+            "final_objective": hist[-1][1],
+            "final_dist_to_optimum": hist[-1][2],
+            "region_nodes": hist[-1][3],
+            "touched_edges": hist[-1][4],
+        })
+
+        # Random.
+        for seed in RANDOM_SEEDS:
+            print(f"Random seed {seed}...")
+
+            _, hist = run_random(
+                rho0,
+                edges,
+                weights,
+                knn,
+                rho_star,
+                pct,
+                seed,
+            )
+
+            rows.append({
+                "method": "random",
+                "budget_pct": pct,
+                "seed": seed,
+                "final_objective": hist[-1][1],
+                "final_dist_to_optimum": hist[-1][2],
+                "region_nodes": hist[-1][3],
+                "touched_edges": hist[-1][4],
+            })
+
+    # ---------------------------------------------------------
+    # PRINT SUMMARY
+    # ---------------------------------------------------------
+
+    print("\nFINAL OPTIMIZATION RESULTS")
+    print(
+        "method             pct   objective       "
+        "dist_to_opt   region   edges"
+    )
+    print("-" * 95)
+
+    for pct in BUDGET_PCTS:
+        for method in [
+            "adaptive",
+            "weighted_degree",
+            "random",
+        ]:
+            subset = [
+                r for r in rows
+                if r["budget_pct"] == pct
+                and r["method"] == method
+            ]
+
+            if method == "random":
+                obj = np.mean(
+                    [r["final_objective"] for r in subset]
+                )
+                obj_std = np.std(
+                    [r["final_objective"] for r in subset]
+                )
+
+                dist = np.mean(
+                    [r["final_dist_to_optimum"] for r in subset]
+                )
+                dist_std = np.std(
+                    [r["final_dist_to_optimum"] for r in subset]
+                )
+
+                region = np.mean(
+                    [r["region_nodes"] for r in subset]
+                )
+
+                edges_mean = np.mean(
+                    [r["touched_edges"] for r in subset]
+                )
+
+                print(
+                    f"{method:<18}"
+                    f"{pct:>3}%  "
+                    f"{obj:.6e}±{obj_std:.2e}  "
+                    f"{dist:.6e}±{dist_std:.2e}  "
+                    f"{region:>7.1f}  "
+                    f"{edges_mean:>8.1f}"
+                )
+            else:
+                r = subset[0]
+
+                print(
+                    f"{method:<18}"
+                    f"{pct:>3}%  "
+                    f"{r['final_objective']:.6e}  "
+                    f"{r['final_dist_to_optimum']:.6e}  "
+                    f"{r['region_nodes']:>7}  "
+                    f"{r['touched_edges']:>8}"
+                )
+
+    # ---------------------------------------------------------
+    # SAVE
+    # ---------------------------------------------------------
+
+    path = OUT / "pebble_optimization_results.csv"
+
+    fields = [
+        "method",
+        "budget_pct",
+        "seed",
+        "final_objective",
+        "final_dist_to_optimum",
+        "region_nodes",
+        "touched_edges",
+    ]
+
+    with path.open("w", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=fields,
+        )
+        writer.writeheader()
+        writer.writerows(rows)
+
+    print("\nSaved:", path)
+
+
+if __name__ == "__main__":
+    main()

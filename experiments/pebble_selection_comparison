@@ -1,0 +1,852 @@
+#!/usr/bin/env python3
+
+import os
+import math
+import random
+from dataclasses import dataclass
+
+import numpy as np
+from scipy.spatial import cKDTree
+from scipy.sparse import coo_matrix
+from scipy.sparse.linalg import cg
+
+
+# ============================================================
+# Configuration
+# ============================================================
+
+N = 50_000
+KNN = 6
+WEIGHT_K = 6.0
+
+LAMBDA = 1.0
+LR = 0.02
+STEPS = 200
+
+# Match experiments by approximate touched-edge budget.
+TARGET_EDGE_BUDGETS = [16_000, 50_000, 75_000]
+
+RANDOM_SEEDS = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+
+# Number of neighbours used to grow a pebble around a selected center.
+PEBBLE_RADIUS_K = KNN
+
+# Data
+INIT_PATH = "dataset/0_chest_cone/init_0_chest_cone.npy"
+
+# Output
+OUT_PATH = "experiments/pebble_selection_results.npz"
+
+
+# ============================================================
+# Data structures
+# ============================================================
+
+@dataclass
+class Graph:
+    xyz: np.ndarray
+    edges_i: np.ndarray
+    edges_j: np.ndarray
+    weights: np.ndarray
+    neighbors: np.ndarray
+
+
+# ============================================================
+# Graph construction
+# ============================================================
+
+def build_graph(xyz: np.ndarray, k: int = 6, weight_k: float = 6.0):
+    """
+    Build a symmetric undirected KNN graph.
+
+    For each node:
+        - find k nearest neighbours
+        - add each undirected edge once
+        - weight = exp(-||p_i-p_j||^2 / weight_k)
+
+    Returns:
+        Graph
+    """
+
+    print("Building KNN graph...")
+
+    tree = cKDTree(xyz)
+
+    # +1 because the first returned neighbour is the point itself.
+    dists, knn = tree.query(xyz, k=k + 1, workers=-1)
+
+    knn = knn[:, 1:]
+    dists = dists[:, 1:]
+
+    # Store directed neighbourhood table for pebble growth/scoring.
+    neighbors = knn.astype(np.int32)
+
+    # Build unique undirected edges.
+    rows = []
+    cols = []
+    weights = []
+
+    for i in range(len(xyz)):
+        for q in range(k):
+            j = int(knn[i, q])
+
+            # Keep each undirected edge once.
+            if i < j:
+                dist2 = float(dists[i, q] ** 2)
+                w = math.exp(-dist2 / weight_k)
+
+                rows.append(i)
+                cols.append(j)
+                weights.append(w)
+
+    edges_i = np.asarray(rows, dtype=np.int32)
+    edges_j = np.asarray(cols, dtype=np.int32)
+    weights = np.asarray(weights, dtype=np.float64)
+
+    print(f"Nodes: {len(xyz):,}")
+    print(f"Unique undirected edges: {len(weights):,}")
+
+    return Graph(
+        xyz=xyz,
+        edges_i=edges_i,
+        edges_j=edges_j,
+        weights=weights,
+        neighbors=neighbors,
+    )
+
+
+# ============================================================
+# Graph energy / dissimilarity
+# ============================================================
+
+def node_dissimilarity(rho: np.ndarray, graph: Graph):
+    """
+    D_i = sum_j w_ij * (rho_i - rho_j)^2
+
+    This is the local contribution to the weighted graph
+    Laplacian energy.
+
+    We explicitly accumulate the undirected-edge contribution
+    onto both endpoints.
+    """
+
+    i = graph.edges_i
+    j = graph.edges_j
+    w = graph.weights
+
+    diff2 = (rho[i] - rho[j]) ** 2
+    contribution = w * diff2
+
+    score = np.zeros(len(rho), dtype=np.float64)
+
+    np.add.at(score, i, contribution)
+    np.add.at(score, j, contribution)
+
+    return score
+
+
+# ============================================================
+# Pebble expansion
+# ============================================================
+
+def expand_centers(centers: np.ndarray, graph: Graph):
+    """
+    Grow each selected center into a local pebble containing:
+        center + its KNN neighbours.
+
+    Return the union of all nodes touched by the pebbles.
+    """
+
+    touched = np.zeros(len(graph.xyz), dtype=bool)
+
+    touched[centers] = True
+
+    for c in centers:
+        touched[graph.neighbors[c]] = True
+
+    return np.flatnonzero(touched)
+
+
+# ============================================================
+# Touched-edge computation
+# ============================================================
+
+def touched_edge_mask(region: np.ndarray, graph: Graph):
+    """
+    Boundary-aware region:
+    An edge is touched whenever at least one endpoint belongs
+    to the pebble region.
+
+    This is important because it preserves the exact graph
+    Laplacian action on the selected nodes.
+    """
+
+    region_mask = np.zeros(len(graph.xyz), dtype=bool)
+    region_mask[region] = True
+
+    return region_mask[graph.edges_i] | region_mask[graph.edges_j]
+
+
+# ============================================================
+# Choose centers for each strategy
+# ============================================================
+
+def choose_centers(score: np.ndarray,
+                   strategy: str,
+                   n_centers: int,
+                   rng: np.random.Generator):
+
+    n = len(score)
+
+    if n_centers <= 0:
+        raise ValueError("n_centers must be > 0")
+
+    n_centers = min(n_centers, n)
+
+    if strategy == "most_dissimilar":
+        # Largest D_i first.
+        centers = np.argpartition(
+            score,
+            -n_centers
+        )[-n_centers:]
+
+        # Make deterministic ordering.
+        centers = centers[np.argsort(score[centers])[::-1]]
+
+    elif strategy == "least_dissimilar":
+        # Smallest D_i first.
+        centers = np.argpartition(
+            score,
+            n_centers - 1
+        )[:n_centers]
+
+        centers = centers[np.argsort(score[centers])]
+
+    elif strategy == "half_most_half_least":
+        half = n_centers // 2
+
+        high = np.argpartition(
+            score,
+            -half
+        )[-half:]
+
+        low = np.argpartition(
+            score,
+            half - 1
+        )[:half]
+
+        centers = np.concatenate([high, low])
+
+        # If odd number of centers, add one from the high end.
+        if len(centers) < n_centers:
+            remaining = np.setdiff1d(
+                np.arange(n),
+                centers,
+                assume_unique=False,
+            )
+
+            extra = remaining[
+                np.argmax(score[remaining])
+            ]
+
+            centers = np.append(centers, extra)
+
+    elif strategy == "middle":
+        # Nodes closest to the median score.
+        median = np.median(score)
+        distance_from_median = np.abs(score - median)
+
+        centers = np.argpartition(
+            distance_from_median,
+            n_centers - 1
+        )[:n_centers]
+
+        centers = centers[
+            np.argsort(distance_from_median[centers])
+        ]
+
+    elif strategy == "random":
+        centers = rng.choice(
+            n,
+            size=n_centers,
+            replace=False,
+        )
+
+    else:
+        raise ValueError(f"Unknown strategy: {strategy}")
+
+    return np.asarray(centers, dtype=np.int32)
+
+
+# ============================================================
+# Determine center count for a target edge budget
+# ============================================================
+
+def centers_for_target_edges(score,
+                             strategy,
+                             graph,
+                             target_edges,
+                             rng,
+                             tolerance=250):
+    """
+    Find a center count whose pebble expansion produces an
+    edge count close to the requested target.
+
+    Because pebble unions overlap, the mapping
+        number of centers -> touched edges
+    is not perfectly linear.
+
+    We therefore use a binary-search-like procedure followed
+    by a small local refinement.
+    """
+
+    n = len(score)
+
+    # Initial guess based on the observed scale.
+    low = 1
+    high = min(n, max(2, target_edges // (KNN + 1)))
+
+    best_centers = None
+    best_region = None
+    best_edge_mask = None
+    best_error = float("inf")
+
+    # Expand high until we reach/exceed the target.
+    while high < n:
+        centers = choose_centers(score, strategy, high, rng)
+        region = expand_centers(centers, graph)
+        edge_mask = touched_edge_mask(region, graph)
+        edge_count = int(edge_mask.sum())
+
+        error = abs(edge_count - target_edges)
+
+        if error < best_error:
+            best_error = error
+            best_centers = centers
+            best_region = region
+            best_edge_mask = edge_mask
+
+        if edge_count >= target_edges:
+            break
+
+        high = min(n, high * 2)
+
+    # Binary search.
+    left = low
+    right = high
+
+    while left <= right:
+
+        mid = (left + right) // 2
+
+        centers = choose_centers(score, strategy, mid, rng)
+        region = expand_centers(centers, graph)
+        edge_mask = touched_edge_mask(region, graph)
+
+        edge_count = int(edge_mask.sum())
+        error = abs(edge_count - target_edges)
+
+        if error < best_error:
+            best_error = error
+            best_centers = centers
+            best_region = region
+            best_edge_mask = edge_mask
+
+        if edge_count < target_edges:
+            left = mid + 1
+        elif edge_count > target_edges:
+            right = mid - 1
+        else:
+            break
+
+    # Local refinement around the selected center count.
+    if best_centers is not None:
+        base_count = len(best_centers)
+
+        for nc in range(
+            max(1, base_count - 10),
+            min(n, base_count + 10) + 1
+        ):
+            centers = choose_centers(score, strategy, nc, rng)
+            region = expand_centers(centers, graph)
+            edge_mask = touched_edge_mask(region, graph)
+
+            edge_count = int(edge_mask.sum())
+            error = abs(edge_count - target_edges)
+
+            if error < best_error:
+                best_error = error
+                best_centers = centers
+                best_region = region
+                best_edge_mask = edge_mask
+
+    return (
+        best_centers,
+        best_region,
+        best_edge_mask,
+    )
+
+
+# ============================================================
+# Exact objective
+# ============================================================
+
+def graph_energy(rho, graph):
+    i = graph.edges_i
+    j = graph.edges_j
+    w = graph.weights
+
+    return np.sum(
+        w * (rho[i] - rho[j]) ** 2
+    )
+
+
+def objective(rho, rho0, graph, lam):
+    data_term = 0.5 * np.sum((rho - rho0) ** 2)
+    smooth_term = lam * graph_energy(rho, graph)
+
+    return data_term + smooth_term
+
+
+# ============================================================
+# Full graph Laplacian action
+# ============================================================
+
+def full_laplacian_action(rho, graph):
+    """
+    L rho for weighted undirected graph.
+
+    L_ii = sum_j w_ij
+    L_ij = -w_ij
+    """
+
+    n = len(rho)
+
+    i = graph.edges_i
+    j = graph.edges_j
+    w = graph.weights
+
+    out = np.zeros(n, dtype=np.float64)
+
+    diff = rho[i] - rho[j]
+    contrib = w * diff
+
+    np.add.at(out, i, contrib)
+    np.add.at(out, j, -contrib)
+
+    return out
+
+
+# ============================================================
+# Boundary-aware pebble gradient
+# ============================================================
+
+def local_gradient(rho,
+                   rho0,
+                   graph,
+                   edge_mask,
+                   lam):
+    """
+    Exact gradient contributions from all edges touching
+    the current pebble region.
+
+    grad_i =
+        rho_i-rho0_i
+        + 2*lambda * sum_j w_ij (rho_i-rho_j)
+
+    Because the objective contains sum_(i,j) over undirected
+    edges, the factor 2 appears here.
+    """
+
+    n = len(rho)
+
+    i = graph.edges_i[edge_mask]
+    j = graph.edges_j[edge_mask]
+    w = graph.weights[edge_mask]
+
+    grad = rho - rho0
+
+    diff = rho[i] - rho[j]
+    contrib = 2.0 * lam * w * diff
+
+    np.add.at(grad, i, contrib)
+    np.add.at(grad, j, -contrib)
+
+    return grad
+
+
+# ============================================================
+# Full optimization
+# ============================================================
+
+def run_full_optimization(rho0, graph):
+    """
+    Full reference optimization using the exact graph gradient.
+    """
+
+    rho = rho0.copy()
+
+    objectives = []
+
+    for step in range(STEPS):
+        grad = (
+            rho
+            - rho0
+            + 2.0 * LAMBDA * full_laplacian_action(rho, graph)
+        )
+
+        rho -= LR * grad
+
+        objectives.append(
+            objective(rho, rho0, graph, LAMBDA)
+        )
+
+    return rho, np.asarray(objectives)
+
+
+# ============================================================
+# Pebbled optimization
+# ============================================================
+
+def run_pebbled_optimization(rho0,
+                             graph,
+                             strategy,
+                             target_edges,
+                             seed=0):
+    """
+    Optimize only on the selected pebble region.
+
+    Important:
+        The score is evaluated from the current rho.
+        The selected region is therefore adaptive in time for
+        the disagreement-based methods.
+
+    Random:
+        Fresh random pebble centers are generated every step.
+    """
+
+    rng = np.random.default_rng(seed)
+
+    rho = rho0.copy()
+
+    objectives = []
+    edge_counts = []
+    center_counts = []
+    region_counts = []
+
+    for step in range(STEPS):
+
+        # ----------------------------------------------------
+        # Current local disagreement score.
+        # ----------------------------------------------------
+        score = node_dissimilarity(rho, graph)
+
+        # ----------------------------------------------------
+        # Pick pebble centers for this step.
+        # ----------------------------------------------------
+        centers, region, edge_mask = centers_for_target_edges(
+            score=score,
+            strategy=strategy,
+            graph=graph,
+            target_edges=target_edges,
+            rng=rng,
+        )
+
+        # ----------------------------------------------------
+        # Exact boundary-aware gradient.
+        # ----------------------------------------------------
+        grad = local_gradient(
+            rho=rho,
+            rho0=rho0,
+            graph=graph,
+            edge_mask=edge_mask,
+            lam=LAMBDA,
+        )
+
+        # Do not update nodes outside the pebble region.
+        update_mask = np.zeros(N, dtype=bool)
+        update_mask[region] = True
+
+        grad[~update_mask] = 0.0
+
+        rho -= LR * grad
+
+        # ----------------------------------------------------
+        # Logging.
+        # ----------------------------------------------------
+        objectives.append(
+            objective(rho, rho0, graph, LAMBDA)
+        )
+
+        edge_counts.append(
+            int(edge_mask.sum())
+        )
+
+        center_counts.append(
+            int(len(centers))
+        )
+
+        region_counts.append(
+            int(len(region))
+        )
+
+    return {
+        "rho": rho,
+        "objectives": np.asarray(objectives),
+        "edge_counts": np.asarray(edge_counts),
+        "center_counts": np.asarray(center_counts),
+        "region_counts": np.asarray(region_counts),
+    }
+
+
+# ============================================================
+# Main experiment
+# ============================================================
+
+def main():
+
+    print("=" * 70)
+    print("PEBBLE SELECTION COMPARISON")
+    print("=" * 70)
+
+    # --------------------------------------------------------
+    # Load data.
+    # --------------------------------------------------------
+    data = np.load(INIT_PATH)
+
+    if data.shape[1] < 4:
+        raise ValueError(
+            f"Expected init array with >=4 columns, got {data.shape}"
+        )
+
+    xyz = data[:, :3].astype(np.float64)
+
+    # Density is column 4.
+    rho0 = data[:, 3].astype(np.float64)
+
+    print(f"Loaded {len(xyz):,} Gaussians.")
+    print(f"Density range: [{rho0.min():.6f}, {rho0.max():.6f}]")
+
+    # --------------------------------------------------------
+    # Build graph.
+    # --------------------------------------------------------
+    graph = build_graph(
+        xyz,
+        k=KNN,
+        weight_k=WEIGHT_K,
+    )
+
+    n_edges = len(graph.weights)
+
+    # --------------------------------------------------------
+    # Full optimum / reference.
+    # --------------------------------------------------------
+    print("\nRunning full optimization...")
+
+    rho_full, full_curve = run_full_optimization(
+        rho0,
+        graph,
+    )
+
+    full_final = full_curve[-1]
+
+    print(f"Full final objective: {full_final:.8f}")
+
+    # Also solve exact quadratic optimum with CG.
+    #
+    # Objective:
+    #   1/2 ||rho-rho0||^2 + lambda rho^T L rho
+    #
+    # Gradient:
+    #   rho-rho0 + 2 lambda L rho = 0
+    #
+    # Thus:
+    #   (I + 2 lambda L) rho = rho0
+    #
+    # We define the matrix explicitly here only for the reference.
+    print("\nComputing exact CG optimum...")
+
+    i = graph.edges_i
+    j = graph.edges_j
+    w = graph.weights
+
+    diag = np.zeros(N, dtype=np.float64)
+
+    np.add.at(diag, i, w)
+    np.add.at(diag, j, w)
+
+    rows = np.concatenate([
+        i,
+        j,
+        np.arange(N),
+    ])
+
+    cols = np.concatenate([
+        j,
+        i,
+        np.arange(N),
+    ])
+
+    vals = np.concatenate([
+        -2.0 * w * LAMBDA,
+        -2.0 * w * LAMBDA,
+        1.0 + 2.0 * LAMBDA * diag,
+    ])
+
+    # The first two blocks are off-diagonal terms.
+    # Diagonal is added above.
+    A = coo_matrix(
+        (vals, (rows, cols)),
+        shape=(N, N),
+    ).tocsr()
+
+    rho_star, info = cg(
+        A,
+        rho0,
+        maxiter=500,
+        rtol=1e-8,
+    )
+
+    if info != 0:
+        print(f"WARNING: CG info = {info}")
+
+    exact_obj = objective(
+        rho_star,
+        rho0,
+        graph,
+        LAMBDA,
+    )
+
+    print(f"Exact CG optimum: {exact_obj:.8f}")
+
+    # --------------------------------------------------------
+    # Strategies.
+    # --------------------------------------------------------
+    strategies = [
+        "most_dissimilar",
+        "least_dissimilar",
+        "half_most_half_least",
+        "middle",
+        "random",
+    ]
+
+    results = {
+        "full_curve": full_curve,
+        "exact_optimum": np.array([exact_obj]),
+    }
+
+    # --------------------------------------------------------
+    # Run strategies.
+    # --------------------------------------------------------
+    for target_edges in TARGET_EDGE_BUDGETS:
+
+        print("\n" + "=" * 70)
+        print(f"TARGET EDGE BUDGET = {target_edges:,}")
+        print("=" * 70)
+
+        for strategy in strategies:
+
+            print(f"\n--- {strategy} ---")
+
+            curves = []
+            final_objectives = []
+            final_distances = []
+            mean_edges = []
+            std_edges = []
+
+            # Random is stochastic.
+            # The others are deterministic.
+            seeds = (
+                RANDOM_SEEDS
+                if strategy == "random"
+                else [0]
+            )
+
+            for seed in seeds:
+
+                result = run_pebbled_optimization(
+                    rho0=rho0,
+                    graph=graph,
+                    strategy=strategy,
+                    target_edges=target_edges,
+                    seed=seed,
+                )
+
+                curves.append(
+                    result["objectives"]
+                )
+
+                final_objectives.append(
+                    result["objectives"][-1]
+                )
+
+                final_distances.append(
+                    np.linalg.norm(
+                        result["rho"] - rho_star
+                    )
+                )
+
+                mean_edges.append(
+                    result["edge_counts"].mean()
+                )
+
+                std_edges.append(
+                    result["edge_counts"].std()
+                )
+
+            curves = np.asarray(curves)
+
+            print(
+                f"final objective: "
+                f"{np.mean(final_objectives):.8f}"
+                f"{' ± %.8f' % np.std(final_objectives) if len(seeds) > 1 else ''}"
+            )
+
+            print(
+                f"distance to exact optimum: "
+                f"{np.mean(final_distances):.8f}"
+                f"{' ± %.8f' % np.std(final_distances) if len(seeds) > 1 else ''}"
+            )
+
+            print(
+                f"mean touched edges: "
+                f"{np.mean(mean_edges):.2f}"
+                f"{' ± %.2f' % np.std(mean_edges) if len(seeds) > 1 else ''}"
+            )
+
+            print(
+                f"mean edge saving: "
+                f"{100.0 * (1.0 - np.mean(mean_edges) / n_edges):.4f}%"
+            )
+
+            key = f"{strategy}_{target_edges}"
+
+            results[f"{key}_curves"] = curves
+            results[f"{key}_final_objective"] = np.asarray(
+                final_objectives
+            )
+            results[f"{key}_distance"] = np.asarray(
+                final_distances
+            )
+            results[f"{key}_mean_edges"] = np.asarray(
+                mean_edges
+            )
+            results[f"{key}_std_edges"] = np.asarray(
+                std_edges
+            )
+
+    # --------------------------------------------------------
+    # Save.
+    # --------------------------------------------------------
+    np.savez_compressed(
+        OUT_PATH,
+        **results,
+    )
+
+    print("\n" + "=" * 70)
+    print(f"Saved results to: {OUT_PATH}")
+    print("=" * 70)
+
+
+if __name__ == "__main__":
+    main()
