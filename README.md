@@ -116,7 +116,7 @@ The experiments also record the spatial separation of selected pebble centers.
 
 ## Repository structure
 
-
+```text
 r2-gaussian-pebbling/
 ├── README.md
 ├── experiments/
@@ -135,6 +135,7 @@ r2-gaussian-pebbling/
 │   └── tables/
 └── docs/
     └── experimental_findings.pdf
+```text
 
 ## Dataset and environment
 
